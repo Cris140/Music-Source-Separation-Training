@@ -25,7 +25,8 @@ warnings.filterwarnings("ignore")
 def run_folder(model, args, config, device, verbose=False):
     start_time = time.time()
     model.eval()
-    all_mixtures_path = glob.glob(args.input_folder + '/*.*')
+    extensions = ['wav', 'mp3', 'm4a', 'aac', 'opus', 'ogg', 'flac', 'webm', 'weba']
+    all_mixtures_path = [file for ext in extensions for file in glob.glob(args.input_folder + '/*.' + ext)]
     all_mixtures_path.sort()
     print('Total files found: {}'.format(len(all_mixtures_path)))
 
