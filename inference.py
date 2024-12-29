@@ -4,7 +4,7 @@ __author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
 import argparse
 import time
 import librosa
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import sys
 import os
 import glob
@@ -12,6 +12,7 @@ import torch
 import numpy as np
 import soundfile as sf
 import torch.nn as nn
+from utils import prefer_target_instrument
 
 # Using the embedded version of Python can also correctly import the utils module.
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -25,17 +26,22 @@ warnings.filterwarnings("ignore")
 def run_folder(model, args, config, device, verbose=False):
     start_time = time.time()
     model.eval()
-    extensions = ['wav', 'mp3', 'm4a', 'aac', 'opus', 'ogg', 'flac', 'webm', 'weba']
-    all_mixtures_path = [file for ext in extensions for file in glob.glob(args.input_folder + '/*.' + ext)]
-    all_mixtures_path.sort()
-    print('Total files found: {}'.format(len(all_mixtures_path)))
+    if args.input_file:
+        if not os.path.isfile(args.input_file):
+            print(f"Error: Input file '{args.input_file}' does not exist.")
+            return
+        all_mixtures_path = [args.input_file]
+    else:
+        all_mixtures_path = glob.glob(args.input_folder + '/*.*')
+        all_mixtures_path.sort()
+    sample_rate = 44100
+    if 'sample_rate' in config.audio:
+        sample_rate = config.audio['sample_rate']
+    print('Total files found: {} Use sample rate: {}'.format(len(all_mixtures_path), sample_rate))
 
-    instruments = config.training.instruments.copy()
-    if config.training.target_instrument is not None:
-        instruments = [config.training.target_instrument]
+    instruments = prefer_target_instrument(config)[:]
 
-    if not os.path.isdir(args.store_dir):
-        os.mkdir(args.store_dir)
+    os.makedirs(args.store_dir, exist_ok=True)
 
     if not verbose:
         all_mixtures_path = tqdm(all_mixtures_path, desc="Total progress")
@@ -50,7 +56,7 @@ def run_folder(model, args, config, device, verbose=False):
         if not verbose:
             all_mixtures_path.set_postfix({'track': os.path.basename(path)})
         try:
-            mix, sr = librosa.load(path, sr=44100, mono=False)
+            mix, sr = librosa.load(path, sr=sample_rate, mono=False)
         except Exception as e:
             print('Cannot read track: {}'.format(path))
             print('Error message: {}'.format(str(e)))
@@ -96,7 +102,8 @@ def run_folder(model, args, config, device, verbose=False):
         # Create a new `instr` in instruments list, 'instrumental' 
         if args.extract_instrumental:
             instr = 'vocals' if 'vocals' in instruments else instruments[0]
-            instruments.append('instrumental')
+            if 'instrumental' not in instruments:
+                instruments.append('instrumental')
             # Output "instrumental", which is an inverse of 'vocals' or the first stem in list if 'vocals' absent
             waveforms['instrumental'] = mix_orig - waveforms[instr]
 
@@ -124,6 +131,7 @@ def proc_folder(args):
     parser.add_argument("--config_path", type=str, help="path to config file")
     parser.add_argument("--start_check_point", type=str, default='', help="Initial checkpoint to valid weights")
     parser.add_argument("--input_folder", type=str, help="folder with mixtures to process")
+    parser.add_argument("--input_file", type=str, help="path to a single file to process")
     parser.add_argument("--store_dir", default="", type=str, help="path to store results as wav file")
     parser.add_argument("--device_ids", nargs='+', type=int, default=0, help='list of gpu ids')
     parser.add_argument("--extract_instrumental", action='store_true', help="invert vocals to get instrumental if provided")
@@ -155,13 +163,16 @@ def proc_folder(args):
     model, config = get_model_from_config(args.model_type, args.config_path)
     if args.start_check_point != '':
         print('Start from checkpoint: {}'.format(args.start_check_point))
-        if args.model_type == 'htdemucs':
-            state_dict = torch.load(args.start_check_point, map_location = device, weights_only=False)
+        if args.model_type in ['htdemucs', 'apollo']:
+            state_dict = torch.load(args.start_check_point, map_location=device, weights_only=False)
             # Fix for htdemucs pretrained models
             if 'state' in state_dict:
                 state_dict = state_dict['state']
+            # Fix for apollo pretrained models
+            if 'state_dict' in state_dict:
+                state_dict = state_dict['state_dict']
         else:
-            state_dict = torch.load(args.start_check_point, map_location = device, weights_only=True)
+            state_dict = torch.load(args.start_check_point, map_location=device, weights_only=True)
         model.load_state_dict(state_dict)
     print("Instruments: {}".format(config.training.instruments))
 
@@ -172,6 +183,7 @@ def proc_folder(args):
     model = model.to(device)
 
     print("Model load time: {:.2f} sec".format(time.time() - model_load_start_time))
+    
 
     run_folder(model, args, config, device, verbose=True)
 

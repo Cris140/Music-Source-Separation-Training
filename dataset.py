@@ -11,7 +11,7 @@ import pickle
 import time
 import itertools
 import multiprocessing
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from glob import glob
 import audiomentations as AU
 import pedalboard as PB
@@ -26,8 +26,15 @@ def load_chunk(path, length, chunk_size, offset=None):
         x = sf.read(path, dtype='float32', start=offset, frames=chunk_size)[0]
     else:
         x = sf.read(path, dtype='float32')[0]
-        pad = np.zeros([chunk_size - length, 2])
-        x = np.concatenate([x, pad])
+        if len(x.shape) == 1:
+            # Mono case
+            pad = np.zeros((chunk_size - length))
+        else:
+            pad = np.zeros([chunk_size - length, x.shape[-1]])
+        x = np.concatenate([x, pad], axis=0)
+    # Mono fix
+    if len(x.shape) == 1:
+        x = np.expand_dims(x, axis=1)
     return x.T
 
 
@@ -108,7 +115,7 @@ class MSSDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.config.training.num_steps * self.batch_size
 
-    def read_from_metadata_cache(self, track_paths):
+    def read_from_metadata_cache(self, track_paths, instr=None):
         metadata = []
         if os.path.isfile(self.metadata_path):
             if self.verbose:
@@ -116,6 +123,9 @@ class MSSDataset(torch.utils.data.Dataset):
             old_metadata = pickle.load(open(self.metadata_path, 'rb'))
         else:
             return track_paths, metadata
+
+        if instr:
+            old_metadata = old_metadata[instr]
 
         # We will not re-read tracks existed in old metadata file
         track_paths_set = set(track_paths)
@@ -153,7 +163,7 @@ class MSSDataset(torch.utils.data.Dataset):
                 track_paths += sorted(glob(self.data_path + '/*'))
 
             track_paths = [path for path in track_paths if os.path.basename(path)[0] != '.' and os.path.isdir(path)]
-            track_paths, metadata = self.read_from_metadata_cache(track_paths)
+            track_paths, metadata = self.read_from_metadata_cache(track_paths, None)
 
             if read_metadata_procs <= 1:
                 for path in tqdm(track_paths):
@@ -184,7 +194,7 @@ class MSSDataset(torch.utils.data.Dataset):
                     track_paths += sorted(glob(self.data_path + '/{}/*.wav'.format(instr)))
                     track_paths += sorted(glob(self.data_path + '/{}/*.flac'.format(instr)))
 
-                track_paths, metadata[instr] = self.read_from_metadata_cache(track_paths)
+                track_paths, metadata[instr] = self.read_from_metadata_cache(track_paths, instr)
 
                 if read_metadata_procs <= 1:
                     for path in tqdm(track_paths):
@@ -214,7 +224,7 @@ class MSSDataset(torch.utils.data.Dataset):
                     part = df[df['instrum'] == instr].copy()
                     metadata[instr] = []
                     track_paths = list(part['path'].values)
-                    track_paths, metadata[instr] = self.read_from_metadata_cache(track_paths)
+                    track_paths, metadata[instr] = self.read_from_metadata_cache(track_paths, instr)
 
                     for path in tqdm(track_paths):
                         if not os.path.isfile(path):

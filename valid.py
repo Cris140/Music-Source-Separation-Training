@@ -3,217 +3,657 @@ __author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
 
 import argparse
 import time
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import sys
 import os
 import glob
 import copy
 import torch
+import librosa
 import soundfile as sf
 import numpy as np
 import torch.nn as nn
 import multiprocessing
-
+from utils import demix, get_metrics, get_model_from_config, prefer_target_instrument
+from typing import Tuple, Dict, List, Union
 import warnings
+from ml_collections import ConfigDict
 warnings.filterwarnings("ignore")
 
-from utils import demix, sdr, get_model_from_config
+
+def read_audio_transposed(path: str, instr: str = None, skip_err: bool = False) -> Tuple[np.ndarray, int]:
+    """
+    Reads an audio file, ensuring mono audio is converted to two-dimensional format,
+    and transposes the data to have channels as the first dimension.
+    Parameters
+    ----------
+    path : str
+        Path to the audio file.
+    skip_err: bool
+        If true, not raise errors
+    instr:
+        name of instument
+    Returns
+    -------
+    Tuple[np.ndarray, int]
+        A tuple containing:
+        - Transposed audio data as a NumPy array with shape (channels, length).
+          For mono audio, the shape will be (1, length).
+        - Sampling rate (int), e.g., 44100.
+    """
+
+    try:
+        mix, sr = sf.read(path)
+    except Exception as e:
+        if skip_err:
+            print(f"No stem {instr}: skip!")
+            return None, None
+        else:
+            raise RuntimeError(f"Error reading the file at {path}: {e}")
+    else:
+        if len(mix.shape) == 1:  # For mono audio
+            mix = np.expand_dims(mix, axis=-1)
+        return mix.T, sr
 
 
-def proc_list_of_files(
-    mixture_paths,
-    model,
+def normalize_audio(audio: np.ndarray) -> tuple[np.ndarray, Dict[str, float]]:
+    """
+    Normalize an audio signal by subtracting the mean and dividing by the standard deviation.
+
+    Parameters:
+    ----------
+    audio : np.ndarray
+        Input audio array with shape (channels, time) or (time,).
+
+    Returns:
+    -------
+    tuple[np.ndarray, dict[str, float]]
+        - Normalized audio array with the same shape as the input.
+        - Dictionary containing the mean and standard deviation of the original audio.
+    """
+
+    mono = audio.mean(0)
+    mean, std = mono.mean(), mono.std()
+    return (audio - mean) / std, {"mean": mean, "std": std}
+
+
+def denormalize_audio(audio: np.ndarray, norm_params: Dict[str, float]) -> np.ndarray:
+    """
+    Denormalize an audio signal by reversing the normalization process (multiplying by the standard deviation
+    and adding the mean).
+
+    Parameters:
+    ----------
+    audio : np.ndarray
+        Normalized audio array to be denormalized.
+    norm_params : dict[str, float]
+        Dictionary containing the 'mean' and 'std' values used for normalization.
+
+    Returns:
+    -------
+    np.ndarray
+        Denormalized audio array with the same shape as the input.
+    """
+
+    return audio * norm_params["std"] + norm_params["mean"]
+
+
+
+def logging(logs: List[str], text: str, verbose_logging: bool = False) -> None:
+    """
+    Log validation information by printing the text and appending it to a log list.
+
+    Parameters:
+    ----------
+    store_dir : str
+        Directory to store the logs. If empty, logs are not stored.
+    logs : List[str]
+        List where the logs will be appended if the store_dir is specified.
+    text : str
+        The text to be logged, printed, and optionally added to the logs list.
+
+    Returns:
+    -------
+    None
+        This function modifies the logs list in place and prints the text.
+    """
+
+    print(text)
+    if verbose_logging:
+        logs.append(text)
+
+
+def write_results_in_file(store_dir: str, logs: List[str]) -> None:
+    """
+    Write the list of results into a file in the specified directory.
+
+    Parameters:
+    ----------
+    store_dir : str
+        The directory where the results file will be saved.
+    results : List[str]
+        A list of result strings to be written to the file.
+
+    Returns:
+    -------
+    None
+    """
+    with open(f'{store_dir}/results.txt', 'w') as out:
+        for item in logs:
+            out.write(item + "\n")
+
+
+def get_mixture_paths(
+    args,
+    verbose: bool,
+    config: ConfigDict,
+    extension: str
+) -> List[str]:
+    """
+    Retrieve paths to mixture files in the specified validation directories.
+
+    Parameters:
+    ----------
+    valid_path : List[str]
+        A list of directories to search for validation mixtures.
+    verbose : bool
+        If True, prints detailed information about the search process.
+    config : ConfigDict
+        Configuration object containing parameters like `inference.num_overlap` and `inference.batch_size`.
+    extension : str
+        File extension of the mixture files (e.g., 'wav').
+
+    Returns:
+    -------
+    List[str]
+        A list of file paths to the mixture files.
+    """
+    try:
+        valid_path = args.valid_path
+    except Exception as e:
+        print('No valid path in args')
+        raise e
+
+    all_mixtures_path = []
+    for path in valid_path:
+        part = sorted(glob.glob(f"{path}/*/mixture.{extension}"))
+        if len(part) == 0:
+            if verbose:
+                print(f'No validation data found in: {path}')
+        all_mixtures_path += part
+    if verbose:
+        print(f'Total mixtures: {len(all_mixtures_path)}')
+        print(f'Overlap: {config.inference.num_overlap} Batch size: {config.inference.batch_size}')
+
+    return all_mixtures_path
+
+
+def update_metrics_and_pbar(
+        track_metrics: Dict,
+        all_metrics: Dict,
+        instr: str,
+        pbar_dict: Dict,
+        mixture_paths: Union[List[str], tqdm],
+        verbose: bool = False
+) -> None:
+    """
+    Update metrics dictionary and progress bar with new metric values.
+
+    Parameters:
+    ----------
+    track_metrics : Dict
+        Dictionary with metric names as keys and their computed values as values.
+    all_metrics : Dict
+        Dictionary to store all metrics, organized by metric name and instrument.
+    instr : str
+        Name of the instrument for which the metrics are being computed.
+    pbar_dict : Dict
+        Dictionary for progress bar updates.
+    mixture_paths : tqdm, optional
+        Progress bar object, if available. Default is None.
+    verbose : bool, optional
+        If True, prints metric values to the console. Default is False.
+    """
+    for metric_name, metric_value in track_metrics.items():
+        if verbose:
+            print(f"Metric {metric_name:11s} value: {metric_value:.4f}")
+        all_metrics[metric_name][instr].append(metric_value)
+        pbar_dict[f'{metric_name}_{instr}'] = metric_value
+
+    if mixture_paths is not None:
+        try:
+            mixture_paths.set_postfix(pbar_dict)
+        except Exception:
+            pass
+
+
+def apply_tta(
+        config,
+        model: torch.nn.Module,
+        mix: torch.Tensor,
+        waveforms_orig: Dict[str, torch.Tensor],
+        device: torch.device,
+        model_type: str
+) -> Dict[str, torch.Tensor]:
+    """
+    Apply Test-Time Augmentation (TTA) for source separation.
+
+    This function processes the input mixture with test-time augmentations, including
+    channel inversion and polarity inversion, to enhance the separation results. The
+    results from all augmentations are averaged to produce the final output.
+
+    Parameters:
+    ----------
+    config : Any
+        Configuration object containing model and processing parameters.
+    model : torch.nn.Module
+        The trained model used for source separation.
+    mix : torch.Tensor
+        The mixed audio tensor with shape (channels, time).
+    waveforms_orig : Dict[str, torch.Tensor]
+        Dictionary of original separated waveforms (before TTA) for each instrument.
+    device : torch.device
+        Device (CPU or CUDA) on which the model will be executed.
+    model_type : str
+        Type of the model being used (e.g., "demucs", "custom_model").
+
+    Returns:
+    -------
+    Dict[str, torch.Tensor]
+        Updated dictionary of separated waveforms after applying TTA.
+    """
+    # Create augmentations: channel inversion and polarity inversion
+    track_proc_list = [mix[::-1].copy(), -1.0 * mix.copy()]
+
+    # Process each augmented mixture
+    for i, augmented_mix in enumerate(track_proc_list):
+        waveforms = demix(config, model, augmented_mix, device, model_type=model_type)
+        for el in waveforms:
+            if i == 0:
+                waveforms_orig[el] += waveforms[el][::-1].copy()
+            else:
+                waveforms_orig[el] -= waveforms[el]
+
+    # Average the results across augmentations
+    for el in waveforms_orig:
+        waveforms_orig[el] /= len(track_proc_list) + 1
+
+    return waveforms_orig
+
+
+def process_audio_files(
+    mixture_paths: List[str],
+    model: torch.nn.Module,
     args,
     config,
-    device,
-    verbose=False,
-    is_tqdm=True
-):
-    instruments = config.training.instruments
-    if config.training.target_instrument is not None:
-        instruments = [config.training.target_instrument]
+    device: torch.device,
+    verbose: bool = False,
+    is_tqdm: bool = True
+) -> Dict[str, Dict[str, List[float]]]:
+    """
+    Process a list of audio files, perform source separation, and evaluate metrics.
 
-    if args.store_dir != "":
-        if not os.path.isdir(args.store_dir):
-            os.mkdir(args.store_dir)
+    Parameters:
+    ----------
+    mixture_paths : List[str]
+        List of file paths to the audio mixtures.
+    model : torch.nn.Module
+        The trained model used for source separation.
+    args : Any
+        Argument object containing user-specified options like metrics, model type, etc.
+    config : Any
+        Configuration object containing model and processing parameters.
+    device : torch.device
+        Device (CPU or CUDA) on which the model will be executed.
+    verbose : bool, optional
+        If True, prints detailed logs for each processed file. Default is False.
+    is_tqdm : bool, optional
+        If True, displays a progress bar for file processing. Default is True.
 
-    all_sdr = dict()
-    for instr in config.training.instruments:
-        all_sdr[instr] = []
+    Returns:
+    -------
+    Dict[str, Dict[str, List[float]]]
+        A nested dictionary where the outer keys are metric names,
+        the inner keys are instrument names, and the values are lists of metric scores.
+    """
+    instruments = prefer_target_instrument(config)
+
+    use_tta = getattr(args, 'use_tta', False)
+    #dir to save files, if empty no saving
+    store_dir = getattr(args, 'store_dir', '')
+    #codec to save files
+    extension = getattr(config['inference'],'extension',
+                        getattr(args, 'extension',
+                                'wav') )
+
+    # Initialize metrics dictionary
+    all_metrics = {
+        metric: {instr: [] for instr in config.training.instruments}
+        for metric in args.metrics
+    }
 
     if is_tqdm:
         mixture_paths = tqdm(mixture_paths)
 
     for path in mixture_paths:
         start_time = time.time()
-        mix, sr = sf.read(path)
+        mix, sr = read_audio_transposed(path)
         mix_orig = mix.copy()
-
-        # Fix for mono
-        if len(mix.shape) == 1:
-            mix = np.expand_dims(mix, axis=-1)
-
-        mix = mix.T # (channels, waveform)
         folder = os.path.dirname(path)
-        folder_name = os.path.abspath(folder)
+
+        if 'sample_rate' in config.audio:
+            if sr != config.audio['sample_rate']:
+                orig_length = mix.shape[-1]
+                if verbose:
+                    print(f'Warning: sample rate is different. In config: {config.audio["sample_rate"]} in file {path}: {sr}')
+                mix = librosa.resample(mix, orig_sr=sr, target_sr=config.audio['sample_rate'], res_type='kaiser_best')
+
         if verbose:
-            print('Song: {}'.format(folder_name))
+            folder_name = os.path.abspath(folder)
+            print(f'Song: {folder_name} Shape: {mix.shape}')
 
         if 'normalize' in config.inference:
             if config.inference['normalize'] is True:
-                mono = mix.mean(0)
-                mean = mono.mean()
-                std = mono.std()
-                mix = (mix - mean) / std
+                mix, norm_params = normalize_audio(mix)
 
-        if args.use_tta:
-            # orig, channel inverse, polarity inverse
-            track_proc_list = [mix.copy(), mix[::-1].copy(), -1. * mix.copy()]
-        else:
-            track_proc_list = [mix.copy()]
+        waveforms_orig = demix(config, model, mix.copy(), device, model_type=args.model_type)
 
-        full_result = []
-        for mix in track_proc_list:
-            waveforms = demix(config, model, mix, device, model_type=args.model_type)
-            full_result.append(waveforms)
-
-        # Average all values in single dict
-        waveforms = full_result[0]
-        for i in range(1, len(full_result)):
-            d = full_result[i]
-            for el in d:
-                if i == 2:
-                    waveforms[el] += -1.0 * d[el]
-                elif i == 1:
-                    waveforms[el] += d[el][::-1].copy()
-                else:
-                    waveforms[el] += d[el]
-        for el in waveforms:
-            waveforms[el] = waveforms[el] / len(full_result)
+        if use_tta:
+            waveforms_orig = apply_tta(config, model, mix, waveforms_orig, device, args.model_type)
 
         pbar_dict = {}
+
         for instr in instruments:
+            if verbose:
+                print(f"Instr: {instr}")
+
             if instr != 'other' or config.training.other_fix is False:
-                try:
-                    track, sr1 = sf.read(folder + '/{}.{}'.format(instr, args.extension))
-
-                    # Fix for mono
-                    if len(track.shape) == 1:
-                        track = np.expand_dims(track, axis=-1)
-
-                except Exception as e:
-                    print('No data for stem: {}. Skip!'.format(instr))
+                track, sr1 = read_audio_transposed(f"{folder}/{instr}.{extension}", instr, skip_err=True)
+                if track is None:
                     continue
             else:
-                # other is actually instrumental
-                track, sr1 = sf.read(folder + '/{}.{}'.format('vocals', args.extension))
+                # if track=vocal+other
+                track, sr1 = read_audio_transposed(f"{folder}/vocals.{extension}")
                 track = mix_orig - track
 
-            estimates = waveforms[instr].T
-            # print(estimates.shape)
+            estimates = waveforms_orig[instr]
+
+            if 'sample_rate' in config.audio:
+                if sr != config.audio['sample_rate']:
+                    estimates = librosa.resample(estimates, orig_sr=config.audio['sample_rate'], target_sr=sr,
+                                                 res_type='kaiser_best')
+                    estimates = librosa.util.fix_length(estimates, size=orig_length)
+
             if 'normalize' in config.inference:
                 if config.inference['normalize'] is True:
-                    estimates = estimates * std + mean
+                    estimates = denormalize_audio(estimates, norm_params)
 
-            if args.store_dir != "":
-                sf.write("{}/{}_{}.wav".format(args.store_dir, os.path.basename(folder), instr), estimates, sr,
-                         subtype='FLOAT')
-            references = np.expand_dims(track, axis=0)
-            estimates = np.expand_dims(estimates, axis=0)
-            sdr_val = sdr(references, estimates)[0]
-            if verbose:
-                print(instr, waveforms[instr].shape, sdr_val, "Time: {:.2f} sec".format(time.time() - start_time))
-            all_sdr[instr].append(sdr_val)
-            pbar_dict['sdr_{}'.format(instr)] = sdr_val
+            if store_dir:
+                os.makedirs(store_dir, exist_ok=True)
+                out_wav_name = f"{store_dir}/{os.path.basename(folder)}_{instr}.wav"
+                sf.write(out_wav_name, estimates.T, sr, subtype='FLOAT')
 
-            try:
-                mixture_paths.set_postfix(pbar_dict)
-            except Exception as e:
-                pass
+            track_metrics = get_metrics(
+                args.metrics,
+                track,
+                estimates,
+                mix_orig,
+                device=device,
+            )
 
-    return all_sdr
+            update_metrics_and_pbar(
+                track_metrics,
+                all_metrics,
+                instr, pbar_dict,
+                mixture_paths=mixture_paths,
+                verbose=verbose
+            )
+
+        if verbose:
+            print(f"Time for song: {time.time() - start_time:.2f} sec")
+
+    return all_metrics
 
 
-def valid(model, args, config, device, verbose=False):
+def compute_metric_avg(
+    store_dir: str,
+    args,
+    instruments: List[str],
+    config: ConfigDict,
+    all_metrics: Dict[str, Dict[str, List[float]]],
+    start_time: float
+) -> Dict[str, float]:
+    """
+    Calculate and log the average metrics for each instrument, including per-instrument metrics and overall averages.
+
+    Parameters:
+    ----------
+    store_dir : str
+        Directory to store the logs. If empty, logs are not stored.
+    args : dict
+        Dictionary containing the arguments, used for logging.
+    instruments : List[str]
+        List of instruments to process.
+    config : ConfigDict
+        Configuration dictionary containing the inference settings.
+    all_metrics : Dict[str, Dict[str, List[float]]]
+        A dictionary containing metric values for each instrument.
+        The structure is {metric_name: {instrument_name: [metric_values]}}.
+    start_time : float
+        The starting time for calculating elapsed time.
+
+    Returns:
+    -------
+    Dict[str, float]
+        A dictionary with the average value for each metric across all instruments.
+    """
+
+    logs = []
+    if store_dir:
+        logs.append(str(args))
+        verbose_logging = True
+    else:
+        verbose_logging = False
+
+    logging(logs, text=f"Num overlap: {config.inference.num_overlap}", verbose_logging=verbose_logging)
+
+    metric_avg = {}
+    for instr in instruments:
+        for metric_name in all_metrics:
+            metric_values = np.array(all_metrics[metric_name][instr])
+
+            mean_val = metric_values.mean()
+            std_val = metric_values.std()
+
+            logging(logs, text=f"Instr {instr} {metric_name}: {mean_val:.4f} (Std: {std_val:.4f})", verbose_logging=verbose_logging)
+            if metric_name not in metric_avg:
+                metric_avg[metric_name] = 0.0
+            metric_avg[metric_name] += mean_val
+    for metric_name in all_metrics:
+        metric_avg[metric_name] /= len(instruments)
+
+    if len(instruments) > 1:
+        for metric_name in metric_avg:
+            logging(logs, text=f'Metric avg {metric_name:11s}: {metric_avg[metric_name]:.4f}', verbose_logging=verbose_logging)
+    logging(logs, text=f"Elapsed time: {time.time() - start_time:.2f} sec", verbose_logging=verbose_logging)
+
+    if store_dir:
+        write_results_in_file(store_dir, logs)
+
+    return metric_avg
+
+
+def valid(
+    model: torch.nn.Module,
+    args,
+    config: ConfigDict,
+    device: torch.device,
+    verbose: bool = False
+) -> dict:
+    """
+    Validate a trained model on a set of audio mixtures and compute metrics.
+
+    This function performs validation by separating audio sources from mixtures,
+    computing evaluation metrics, and optionally saving results to a file.
+
+    Parameters:
+    ----------
+    model : torch.nn.Module
+        The trained model for source separation.
+    args : Namespace
+        Command-line arguments or equivalent object containing configurations.
+    config : dict
+        Configuration dictionary with model and processing parameters.
+    device : torch.device
+        The device (CPU or CUDA) to run the model on.
+    verbose : bool, optional
+        If True, enables verbose output during processing. Default is False.
+
+    Returns:
+    -------
+    dict
+        A dictionary of average metrics across all instruments.
+    """
+
     start_time = time.time()
     model.eval().to(device)
-    all_mixtures_path = glob.glob(args.valid_path + '/*/mixture.' + args.extension)
-    print('Total mixtures: {}'.format(len(all_mixtures_path)))
-    print('Overlap: {} Batch size: {}'.format(config.inference.num_overlap, config.inference.batch_size))
 
-    all_sdr = proc_list_of_files(all_mixtures_path, model, args, config, device, verbose, not verbose)
+    # dir to save files, if empty no saving
+    store_dir = getattr(args, 'store_dir', '')
+    # codec to save files
+    extension = getattr(
+        config['inference'],
+        'extension',
+        getattr(args, 'extension', 'wav')
+    )
 
-    instruments = config.training.instruments
-    if config.training.target_instrument is not None:
-        instruments = [config.training.target_instrument]
+    all_mixtures_path = get_mixture_paths(args, verbose, config, extension)
+    all_metrics = process_audio_files(all_mixtures_path, model, args, config, device, verbose, not verbose)
+    instruments = prefer_target_instrument(config)
 
-    if args.store_dir != "":
-        out = open(args.store_dir + '/results.txt', 'w')
-        out.write(str(args) + "\n")
-    print("Num overlap: {}".format(config.inference.num_overlap))
-    sdr_avg = 0.0
-    for instr in instruments:
-        npsdr = np.array(all_sdr[instr])
-        sdr_val = npsdr.mean()
-        sdr_std = npsdr.std()
-        print("Instr SDR {}: {:.4f} (Std: {:.4f})".format(instr, sdr_val, sdr_std))
-        if args.store_dir != "":
-            out.write("Instr SDR {}: {:.4f}".format(instr, sdr_val) + "\n")
-        sdr_avg += sdr_val
-    sdr_avg /= len(instruments)
-    if len(instruments) > 1:
-        print('SDR Avg: {:.4f}'.format(sdr_avg))
-    if args.store_dir != "":
-        out.write('SDR Avg: {:.4f}'.format(sdr_avg) + "\n")
-    print("Elapsed time: {:.2f} sec".format(time.time() - start_time))
-    if args.store_dir != "":
-        out.write("Elapsed time: {:.2f} sec".format(time.time() - start_time) + "\n")
-        out.close()
-
-    return sdr_avg
+    return compute_metric_avg(store_dir, args, instruments, config, all_metrics, start_time)
 
 
-def valid_mp(proc_id, queue, all_mixtures_path, model, args, config, device, return_dict):
+def validate_in_subprocess(
+    proc_id: int,
+    queue: torch.multiprocessing.Queue,
+    all_mixtures_path: List[str],
+    model: torch.nn.Module,
+    args,
+    config: ConfigDict,
+    device: str,
+    return_dict
+) -> None:
+    """
+    Perform validation on a subprocess with multi-processing support. Each process handles inference on a subset of the mixture files
+    and updates the shared metrics dictionary.
+
+    Parameters:
+    ----------
+    proc_id : int
+        The process ID (used to assign metrics to the correct key in `return_dict`).
+    queue : torch.multiprocessing.Queue
+        Queue to receive paths to the mixture files for processing.
+    all_mixtures_path : List[str]
+        List of paths to the mixture files to be processed.
+    model : torch.nn.Module
+        The model to be used for inference.
+    args : dict
+        Dictionary containing various argument configurations (e.g., metrics to calculate).
+    config : ConfigDict
+        Configuration object containing model settings and training parameters.
+    device : str
+        The device to use for inference (e.g., 'cpu', 'cuda:0').
+    return_dict : torch.multiprocessing.Manager().dict
+        Shared dictionary to store the results from each process.
+
+    Returns:
+    -------
+    None
+        The function modifies the `return_dict` in place, but does not return any value.
+    """
+
     m1 = model.eval().to(device)
     if proc_id == 0:
         progress_bar = tqdm(total=len(all_mixtures_path))
-    all_sdr = dict()
-    for instr in config.training.instruments:
-        all_sdr[instr] = []
+
+    # Initialize metrics dictionary
+    all_metrics = {
+        metric: {instr: [] for instr in config.training.instruments}
+        for metric in args.metrics
+    }
+
     while True:
         current_step, path = queue.get()
         if path is None:  # check for sentinel value
             break
-        sdr_single = proc_list_of_files([path], m1, args, config, device, False, False)
+        single_metrics = process_audio_files([path], m1, args, config, device, False, False)
         pbar_dict = {}
         for instr in config.training.instruments:
-            all_sdr[instr] += sdr_single[instr]
-            if len(sdr_single[instr]) > 0:
-                pbar_dict['sdr_{}'.format(instr)] = "{:.4f}".format(sdr_single[instr][0])
+            for metric_name in all_metrics:
+                all_metrics[metric_name][instr] += single_metrics[metric_name][instr]
+                if len(single_metrics[metric_name][instr]) > 0:
+                    pbar_dict[f"{metric_name}_{instr}"] = f"{single_metrics[metric_name][instr][0]:.4f}"
         if proc_id == 0:
             progress_bar.update(current_step - progress_bar.n)
             progress_bar.set_postfix(pbar_dict)
         # print(f"Inference on process {proc_id}", all_sdr)
-    return_dict[proc_id] = all_sdr
+    return_dict[proc_id] = all_metrics
     return
 
 
-def valid_multi_gpu(model, args, config, device_ids, verbose=False):
-    start_time = time.time()
-    all_mixtures_path = glob.glob(args.valid_path + '/*/mixture.' + args.extension)
-    print('Total mixtures: {}'.format(len(all_mixtures_path)))
-    print('Overlap: {} Batch size: {}'.format(config.inference.num_overlap, config.inference.batch_size))
+def run_parallel_validation(
+    verbose: bool,
+    all_mixtures_path: List[str],
+    config: ConfigDict,
+    model: torch.nn.Module,
+    device_ids: List[int],
+    args,
+    return_dict
+) -> None:
+    """
+    Run parallel validation using multiple processes. Each process handles a subset of the mixture files and computes the metrics.
+    The results are stored in a shared dictionary.
+
+    Parameters:
+    ----------
+    verbose : bool
+        Flag to print detailed information about the validation process.
+    all_mixtures_path : List[str]
+        List of paths to the mixture files to be processed.
+    config : ConfigDict
+        Configuration object containing model settings and validation parameters.
+    model : torch.nn.Module
+        The model to be used for inference.
+    device_ids : List[int]
+        List of device IDs (for multi-GPU setups) to use for validation.
+    args : dict
+        Dictionary containing various argument configurations (e.g., metrics to calculate).
+
+    Returns:
+    -------
+        A shared dictionary containing the validation metrics from all processes.
+    """
 
     model = model.to('cpu')
+    try:
+        # For multiGPU training extract single model
+        model = model.module
+    except:
+        pass
+
     queue = torch.multiprocessing.Queue()
     processes = []
-    return_dict = torch.multiprocessing.Manager().dict()
+
     for i, device in enumerate(device_ids):
         if torch.cuda.is_available():
-            device = 'cuda:{}'.format(device)
+            device = f'cuda:{device}'
         else:
             device = 'cpu'
-        p = torch.multiprocessing.Process(target=valid_mp, args=(i, queue, all_mixtures_path, model, args, config, device, return_dict))
+        p = torch.multiprocessing.Process(
+            target=validate_in_subprocess,
+            args=(i, queue, all_mixtures_path, model, args, config, device, return_dict)
+        )
         p.start()
         processes.append(p)
     for i, path in enumerate(all_mixtures_path):
@@ -223,40 +663,67 @@ def valid_multi_gpu(model, args, config, device_ids, verbose=False):
     for p in processes:
         p.join()  # wait for all subprocesses to finish
 
-    all_sdr = dict()
-    for instr in config.training.instruments:
-        all_sdr[instr] = []
-        for i in range(len(device_ids)):
-            all_sdr[instr] += return_dict[i][instr]
+    return
 
-    instruments = config.training.instruments
-    if config.training.target_instrument is not None:
-        instruments = [config.training.target_instrument]
 
-    if args.store_dir != "":
-        out = open(args.store_dir + '/results.txt', 'w')
-        out.write(str(args) + "\n")
-    print("Num overlap: {}".format(config.inference.num_overlap))
-    sdr_avg = 0.0
-    for instr in instruments:
-        npsdr = np.array(all_sdr[instr])
-        sdr_val = npsdr.mean()
-        sdr_std = npsdr.std()
-        print("Instr SDR {}: {:.4f} (Std: {:.4f})".format(instr, sdr_val, sdr_std))
-        if args.store_dir != "":
-            out.write("Instr SDR {}: {:.4f}".format(instr, sdr_val) + "\n")
-        sdr_avg += sdr_val
-    sdr_avg /= len(instruments)
-    if len(instruments) > 1:
-        print('SDR Avg: {:.4f}'.format(sdr_avg))
-    if args.store_dir != "":
-        out.write('SDR Avg: {:.4f}'.format(sdr_avg) + "\n")
-    print("Elapsed time: {:.2f} sec".format(time.time() - start_time))
-    if args.store_dir != "":
-        out.write("Elapsed time: {:.2f} sec".format(time.time() - start_time) + "\n")
-        out.close()
+def valid_multi_gpu(
+    model: torch.nn.Module,
+    args,
+    config: ConfigDict,
+    device_ids: List[int],
+    verbose: bool = False
+) -> Dict[str, float]:
+    """
+    Perform validation across multiple GPUs, processing mixtures and computing metrics using parallel processes.
+    The results from each GPU are aggregated and the average metrics are computed.
 
-    return sdr_avg
+    Parameters:
+    ----------
+    model : torch.nn.Module
+        The model to be used for inference.
+    args : dict
+        Dictionary containing various argument configurations, such as file saving directory and codec settings.
+    config : ConfigDict
+        Configuration object containing model settings and validation parameters.
+    device_ids : List[int]
+        List of device IDs (for multi-GPU setups) to use for validation.
+    verbose : bool, optional
+        Flag to print detailed information about the validation process. Default is False.
+
+    Returns:
+    -------
+    Dict[str, float]
+        A dictionary containing the average metrics for each metric name.
+    """
+
+    start_time = time.time()
+
+    # dir to save files, if empty no saving
+    store_dir = getattr(args, 'store_dir', '')
+    # codec to save files
+    extension = getattr(
+        config['inference'],
+        'extension',
+        getattr(args, 'extension', 'wav')
+    )
+
+    all_mixtures_path = get_mixture_paths(args, verbose, config, extension)
+
+    return_dict = torch.multiprocessing.Manager().dict()
+
+    run_parallel_validation(verbose, all_mixtures_path, config, model, device_ids, args, return_dict)
+
+    all_metrics = dict()
+    for metric in args.metrics:
+        all_metrics[metric] = dict()
+        for instr in config.training.instruments:
+            all_metrics[metric][instr] = []
+            for i in range(len(device_ids)):
+                all_metrics[metric][instr] += return_dict[i][metric][instr]
+
+    instruments = prefer_target_instrument(config)
+
+    return compute_metric_avg(store_dir, args, instruments, config, all_metrics, start_time)
 
 
 def check_validation(args):
@@ -264,13 +731,14 @@ def check_validation(args):
     parser.add_argument("--model_type", type=str, default='mdx23c', help="One of mdx23c, htdemucs, segm_models, mel_band_roformer, bs_roformer, swin_upernet, bandit")
     parser.add_argument("--config_path", type=str, help="path to config file")
     parser.add_argument("--start_check_point", type=str, default='', help="Initial checkpoint to valid weights")
-    parser.add_argument("--valid_path", type=str, help="validate path")
+    parser.add_argument("--valid_path", nargs="+", type=str, help="validate path")
     parser.add_argument("--store_dir", default="", type=str, help="path to store results as wav file")
     parser.add_argument("--device_ids", nargs='+', type=int, default=0, help='list of gpu ids')
     parser.add_argument("--num_workers", type=int, default=0, help="dataloader num_workers")
     parser.add_argument("--pin_memory", type=bool, default=False, help="dataloader pin_memory")
     parser.add_argument("--extension", type=str, default='wav', help="Choose extension for validation")
     parser.add_argument("--use_tta", action='store_true', help="Flag adds test time augmentation during inference (polarity and channel inverse). While this triples the runtime, it reduces noise and slightly improves prediction quality.")
+    parser.add_argument("--metrics", nargs='+', type=str, default=["sdr"], choices=['sdr', 'l1_freq', 'si_sdr', 'neg_log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless', 'fullness'], help='List of metrics to use.')
     if args is None:
         args = parser.parse_args()
     else:
@@ -280,20 +748,23 @@ def check_validation(args):
     torch.multiprocessing.set_start_method('spawn')
 
     model, config = get_model_from_config(args.model_type, args.config_path)
-    if args.start_check_point != '':
-        print('Start from checkpoint: {}'.format(args.start_check_point))
+    if args.start_check_point:
+        print(f'Start from checkpoint: {args.start_check_point}')
         state_dict = torch.load(args.start_check_point)
-        if args.model_type == 'htdemucs':
+        if args.model_type in ['htdemucs', 'apollo']:
             # Fix for htdemucs pretrained models
             if 'state' in state_dict:
                 state_dict = state_dict['state']
+            # Fix for apollo pretrained models
+            if 'state_dict' in state_dict:
+                state_dict = state_dict['state_dict']
         model.load_state_dict(state_dict)
 
-    print("Instruments: {}".format(config.training.instruments))
+    print(f"Instruments: {config.training.instruments}")
 
     device_ids = args.device_ids
     if torch.cuda.is_available():
-        device = torch.device('cuda:0')
+        device = torch.device(f'cuda:{device_ids[0]}')
     else:
         device = 'cpu'
         print('CUDA is not available. Run validation on CPU. It will be very slow...')

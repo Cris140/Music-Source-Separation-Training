@@ -1,4 +1,5 @@
 torch>=2.0.1
+torchaudio
 numpy
 pandas
 scipy
@@ -28,3 +29,7 @@ wandb
 accelerate
 huggingface-hub>=0.23.0
 prodigyopt
+torch_log_wmse
+loralib
+pyaudio
+wxpython==4.2.2
