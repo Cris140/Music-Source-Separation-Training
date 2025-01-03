@@ -32,7 +32,11 @@ def run_folder(model, args, config, device, verbose=False):
             return
         all_mixtures_path = [args.input_file]
     else:
-        all_mixtures_path = glob.glob(args.input_folder + '/*.*')
+        AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.weba', '.mp4', '.webm', 'opus'}
+        all_mixtures_path = [
+            file for file in glob.glob(os.path.join(args.input_folder, '*'))
+            if os.path.isfile(file) and os.path.splitext(file)[1].lower() in AUDIO_EXTENSIONS
+        ]
         all_mixtures_path.sort()
     sample_rate = 44100
     if 'sample_rate' in config.audio:
