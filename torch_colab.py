@@ -55,7 +55,7 @@ def frequency_blend_phases(phase1, phase2, freq_bins, low_cutoff=500, high_cutof
 
     return blended_phase
 
-def transfer_magnitude_phase(source_file, target_file, transfer_magnitude=True, transfer_phase=True, low_cutoff=500, high_cutoff=5000, output_32bit=False, output_folder=None):
+def transfer_magnitude_phase(source_file, target_file, transfer_magnitude=True, transfer_phase=True, low_cutoff=500, high_cutoff=5000, scale_factor=1.85, output_32bit=False, output_folder=None):
     # Determine output path with "(Corrected)" suffix
     target_name, target_ext = os.path.splitext(os.path.basename(target_file))
     
@@ -66,7 +66,8 @@ def transfer_magnitude_phase(source_file, target_file, transfer_magnitude=True, 
     output_file = output_file = os.path.join(output_folder, f"{target_name} (Fixed Instrumental){target_ext}") if output_folder else os.path.join(os.path.dirname(target_file), f"{target_name} (Corrected){target_ext}")
 
     # Load audio using torchaudio
-    print(f"Phase Fixing {target_name}...")
+    print(f"Scale factor: {args.scale_factor}")
+    print(f"Phase Fixing {target_name}{target_ext}...")
     source_waveform, source_sr = torchaudio.load(source_file)
     target_waveform, target_sr = torchaudio.load(target_file)
 
@@ -99,7 +100,7 @@ def transfer_magnitude_phase(source_file, target_file, transfer_magnitude=True, 
 
         # Transfer or blend phase
         if transfer_phase:
-            blended_phase = frequency_blend_phases(target_phs, source_phs, freqs, low_cutoff, high_cutoff)
+            blended_phase = frequency_blend_phases(target_phs, source_phs, freqs, low_cutoff, high_cutoff, scale_factor)
             modified_stft = torch.abs(modified_stft) * torch.exp(1j * blended_phase)
 
         modified_stfts.append(modified_stft)
@@ -118,7 +119,7 @@ def transfer_magnitude_phase(source_file, target_file, transfer_magnitude=True, 
     torchaudio.save(output_file, modified_waveform, target_sr, encoding="PCM_S", bits_per_sample=32 if output_32bit else 16)
     print(f"Corrected file saved as {output_file}")
 
-def process_files(base_folder, unwa_folder, output_folder, low_cutoff, high_cutoff, output_32bit):
+def process_files(base_folder, unwa_folder, output_folder, low_cutoff, high_cutoff, scale_factor, output_32bit):
     # Find all files in the unwa folder (with any suffix)
     unwa_files = glob.glob(os.path.join(unwa_folder, "*"))
 
@@ -146,6 +147,7 @@ def process_files(base_folder, unwa_folder, output_folder, low_cutoff, high_cuto
                 transfer_phase=True,
                 low_cutoff=low_cutoff,
                 high_cutoff=high_cutoff,
+                scale_factor=scale_factor,
                 output_32bit=output_32bit,
                 output_folder=output_folder
             )
@@ -161,6 +163,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_folder", required=True, help="Path to the output folder for corrected files.")
     parser.add_argument("--low_cutoff", type=int, default=500, help="Low cutoff frequency for phase blending.")
     parser.add_argument("--high_cutoff", type=int, default=5000, help="High cutoff frequency for phase blending.")
+    parser.add_argument("--scale_factor", type=float, default=1.85, help="Scale factor for phase blending.")
     parser.add_argument("--output_32bit", action="store_true", help="Save the output as a 32-bit file.")
     
     args = parser.parse_args()
@@ -172,5 +175,6 @@ if __name__ == "__main__":
         output_folder=args.output_folder,
         low_cutoff=args.low_cutoff,
         high_cutoff=args.high_cutoff,
+        scale_factor=args.scale_factor,
         output_32bit=args.output_32bit
     )
