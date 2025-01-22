@@ -66,7 +66,6 @@ def transfer_magnitude_phase(source_file, target_file, transfer_magnitude=True, 
     output_file = output_file = os.path.join(output_folder, f"{target_name} (Fixed Instrumental){target_ext}") if output_folder else os.path.join(os.path.dirname(target_file), f"{target_name} (Corrected){target_ext}")
 
     # Load audio using torchaudio
-    print(f"Scale factor: {args.scale_factor}")
     print(f"Phase Fixing {target_name}{target_ext}...")
     source_waveform, source_sr = torchaudio.load(source_file)
     target_waveform, target_sr = torchaudio.load(target_file)
