@@ -3,6 +3,7 @@ numpy
 pandas
 scipy
 soundfile
+mutagen
 ml_collections
 tqdm
 segmentation_models_pytorch==0.3.3
