@@ -1,6 +1,6 @@
 # utils.py
 # coding: utf-8
-__author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
+__author__ = "Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/"
 
 import numpy as np
 import torch
@@ -15,180 +15,184 @@ from typing import Dict, List, Tuple, Any, Union
 
 
 # ----------------------------------------------------------------------------- #
-#                       CARREGAMENTO DE CONFIGURAÇÕES                           #
+#                        CONFIG & MODEL LOADING                                 #
 # ----------------------------------------------------------------------------- #
 def load_config(model_type: str, config_path: str) -> Union[ConfigDict, OmegaConf]:
-    try:
-        with open(config_path, "r") as f:
-            if model_type == "htdemucs":
-                return OmegaConf.load(config_path)
-            return ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Configuration file not found at {config_path}")
-    except Exception as e:
-        raise ValueError(f"Error loading configuration: {e}")
+    with open(config_path) as f:
+        if model_type == "htdemucs":
+            return OmegaConf.load(config_path)
+        return ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
 
 
-def get_model_from_config(model_type: str, config_path: str) -> Tuple:
-    config = load_config(model_type, config_path)
-
+def get_model_from_config(model_type: str, config_path: str):
+    cfg = load_config(model_type, config_path)
     if model_type == "mdx23c":
         from models.mdx23c_tfc_tdf_v3 import TFC_TDF_net
-        model = TFC_TDF_net(config)
-    elif model_type == "htdemucs":
-        from models.demucs4ht import get_model
-        model = get_model(config)
-    elif model_type == "segm_models":
-        from models.segm_models import Segm_Models_Net
-        model = Segm_Models_Net(config)
-    elif model_type == "torchseg":
-        from models.torchseg_models import Torchseg_Net
-        model = Torchseg_Net(config)
-    elif model_type == "mel_band_roformer":
-        from models.bs_roformer import MelBandRoformer
-        model = MelBandRoformer(**dict(config.model))
-    elif model_type == "bs_roformer":
-        from models.bs_roformer import BSRoformer
-        model = BSRoformer(**dict(config.model))
-    elif model_type == "swin_upernet":
-        from models.upernet_swin_transformers import Swin_UperNet_Model
-        model = Swin_UperNet_Model(config)
-    elif model_type == "bandit":
-        from models.bandit.core.model import MultiMaskMultiSourceBandSplitRNNSimple
-        model = MultiMaskMultiSourceBandSplitRNNSimple(**config.model)
-    elif model_type == "bandit_v2":
-        from models.bandit_v2.bandit import Bandit
-        model = Bandit(**config.kwargs)
-    elif model_type == "scnet_unofficial":
-        from models.scnet_unofficial import SCNet
-        model = SCNet(**config.model)
-    elif model_type == "scnet":
-        from models.scnet import SCNet
-        model = SCNet(**config.model)
-    elif model_type == "apollo":
-        from models.look2hear.models import BaseModel
-        model = BaseModel.apollo(**config.model)
-    elif model_type == "bs_mamba2":
-        from models.ts_bs_mamba2 import Separator
-        model = Separator(**config.model)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
 
-    return model, config
+        return TFC_TDF_net(cfg), cfg
+    if model_type == "htdemucs":
+        from models.demucs4ht import get_model
+
+        return get_model(cfg), cfg
+    if model_type == "segm_models":
+        from models.segm_models import Segm_Models_Net
+
+        return Segm_Models_Net(cfg), cfg
+    if model_type == "torchseg":
+        from models.torchseg_models import Torchseg_Net
+
+        return Torchseg_Net(cfg), cfg
+    if model_type == "mel_band_roformer":
+        from models.bs_roformer import MelBandRoformer
+
+        return MelBandRoformer(**dict(cfg.model)), cfg
+    if model_type == "bs_roformer":
+        from models.bs_roformer import BSRoformer
+
+        return BSRoformer(**dict(cfg.model)), cfg
+    if model_type == "swin_upernet":
+        from models.upernet_swin_transformers import Swin_UperNet_Model
+
+        return Swin_UperNet_Model(cfg), cfg
+    if model_type == "bandit":
+        from models.bandit.core.model import MultiMaskMultiSourceBandSplitRNNSimple
+
+        return MultiMaskMultiSourceBandSplitRNNSimple(**cfg.model), cfg
+    if model_type == "bandit_v2":
+        from models.bandit_v2.bandit import Bandit
+
+        return Bandit(**cfg.kwargs), cfg
+    if model_type == "scnet_unofficial":
+        from models.scnet_unofficial import SCNet
+
+        return SCNet(**cfg.model), cfg
+    if model_type == "scnet":
+        from models.scnet import SCNet
+
+        return SCNet(**cfg.model), cfg
+    if model_type == "apollo":
+        from models.look2hear.models import BaseModel
+
+        return BaseModel.apollo(**cfg.model), cfg
+    if model_type == "bs_mamba2":
+        from models.ts_bs_mamba2 import Separator
+
+        return Separator(**cfg.model), cfg
+    raise ValueError(f"Unknown model type: {model_type}")
 
 
 # ----------------------------------------------------------------------------- #
-#                               UTILITÁRIOS                                     #
+#                               HELPERS                                         #
 # ----------------------------------------------------------------------------- #
 def _getWindowingArray(window_size: int, fade_size: int) -> torch.Tensor:
-    fadein, fadeout = torch.linspace(0, 1, fade_size), torch.linspace(1, 0, fade_size)
-    window = torch.ones(window_size)
-    window[-fade_size:], window[:fade_size] = fadeout, fadein
-    return window
+    win = torch.ones(window_size)
+    win[:fade_size] = torch.linspace(0.0, 1.0, fade_size)
+    win[-fade_size:] = torch.linspace(1.0, 0.0, fade_size)
+    return win
+
+
+def prefer_target_instrument(cfg: ConfigDict) -> List[str]:
+    return [cfg.training.target_instrument] if cfg.training.get("target_instrument") else cfg.training.instruments
 
 
 # ----------------------------------------------------------------------------- #
-#                                DEMIX                                          #
+#                               DEMIX                                           #
 # ----------------------------------------------------------------------------- #
 def demix(
-    config: ConfigDict,
+    cfg: ConfigDict,
     model: torch.nn.Module,
-    mix: torch.Tensor,       # tensor FP16 já na GPU
+    mix: torch.Tensor,  # tensor FP16 na GPU
     device: torch.device,
     model_type: str,
     pbar: bool = False,
 ) -> Dict[str, np.ndarray]:
+    """Separa fontes, evitando qualquer mismatch de dimensão."""
 
-    use_demucs = model_type == "htdemucs"
-    if use_demucs:
-        chunk_size = config.training.samplerate * config.training.segment
-        num_instruments = len(config.training.instruments)
-        num_overlap = config.inference.num_overlap
-        step = chunk_size // num_overlap
+    is_demucs = model_type == "htdemucs"
+    if is_demucs:
+        chunk_size = cfg.training.samplerate * cfg.training.segment
+        n_inst = len(cfg.training.instruments)
+        step = chunk_size // cfg.inference.num_overlap
     else:
-        chunk_size = config.audio.chunk_size
-        num_instruments = len(prefer_target_instrument(config))
-        num_overlap = config.inference.num_overlap
+        chunk_size = cfg.audio.chunk_size
+        n_inst = len(prefer_target_instrument(cfg))
+        step = chunk_size // cfg.inference.num_overlap
         fade_size = chunk_size // 10
-        step = chunk_size // num_overlap
         border = chunk_size - step
-        length_init = mix.shape[-1]
-        window = _getWindowingArray(chunk_size, fade_size).to(device)
-        if length_init > 2 * border and border > 0:
+        win_base = _getWindowingArray(chunk_size, fade_size).to(device)
+        if mix.shape[-1] > 2 * border and border > 0:
             mix = nn.functional.pad(mix, (border, border), mode="reflect")
 
-    batch_size = config.inference.batch_size
-    use_amp = getattr(config.training, "use_amp", True)
+    batch_size = cfg.inference.batch_size
+    use_amp = getattr(cfg.training, "use_amp", True)
 
-    with torch.cuda.amp.autocast(enabled=device.type == "cuda" and use_amp), torch.inference_mode():
-        res = torch.zeros((num_instruments,) + mix.shape[-2:], dtype=torch.float16, device=device)
-        cnt = torch.zeros_like(res)
+    out_buf = torch.zeros((n_inst,) + mix.shape[-2:], dtype=torch.float16, device=device)
+    cnt_buf = torch.zeros_like(out_buf)
 
-        i = 0
-        buf, loc = [], []
-        bar = tqdm(total=mix.shape[1], desc="chunks", leave=False) if pbar else None
+    i = 0
+    chunks, meta = [], []
+    bar = tqdm(total=mix.shape[1], desc="chunks", leave=False) if pbar else None
 
-        while i < mix.shape[1]:
-            part = mix[:, i : i + chunk_size]
-            clen = part.shape[-1]
-            pad_mode = "reflect" if not use_demucs and clen > chunk_size // 2 else "constant"
-            part = nn.functional.pad(part, (0, chunk_size - clen), mode=pad_mode)
-            buf.append(part)
-            loc.append((i, clen))
-            i += step
+    while i < mix.shape[1]:
+        part = mix[:, i : i + chunk_size]
+        raw_len = part.shape[-1]
+        part = nn.functional.pad(part, (0, chunk_size - raw_len), mode="reflect")
+        chunks.append(part)
+        meta.append((i, raw_len))
+        i += step
 
-            if len(buf) >= batch_size or i >= mix.shape[1]:
-                x = model(torch.stack(buf, 0))
+        if len(chunks) >= batch_size or i >= mix.shape[1]:
+            with torch.cuda.amp.autocast(device.type == "cuda" and use_amp), torch.inference_mode():
+                preds = model(torch.stack(chunks, 0))
 
-                for j, (st, ln) in enumerate(loc):
-                    out_len = x[j].shape[-1]            # ← comprimento real
-                    if out_len != ln:                   #   (pode ser menor ~319)
-                        ln = out_len
+            for j, (start, raw_len) in enumerate(meta):
+                pred_len = preds[j].shape[-1]
+                usable = min(raw_len, pred_len)
 
-                    if use_demucs:
-                        res[..., st : st + ln] += x[j, ..., :ln]
-                        cnt[..., st : st + ln] += 1
-                    else:
-                        win = window
-                        if st == 0:
-                            win = win.clone()
-                            win[:fade_size] = 1
-                        elif i >= mix.shape[1]:
-                            win = win.clone()
-                            win[-fade_size:] = 1
+                if is_demucs:
+                    out_buf[..., start : start + usable] += preds[j, ..., :usable]
+                    cnt_buf[..., start : start + usable] += 1
+                else:
+                    win = win_base
+                    if start == 0:
+                        win = win.clone()
+                        win[:fade_size] = 1
+                    elif i >= mix.shape[1]:
+                        win = win.clone()
+                        win[-fade_size:] = 1
 
-                        res[..., st : st + ln] += x[j, ..., :ln] * win[..., :ln]
-                        cnt[..., st : st + ln] += win[..., :ln]
+                    out_buf[..., start : start + usable] += preds[j, ..., :usable] * win[..., :usable]
+                    cnt_buf[..., start : start + usable] += win[..., :usable]
 
-                buf.clear(), loc.clear()
-            if bar:
-                bar.update(step)
+            chunks.clear()
+            meta.clear()
         if bar:
-            bar.close()
+            bar.update(step)
+    if bar:
+        bar.close()
 
-        est = (res / cnt).float().cpu().numpy()
-        if not use_demucs and length_init > 2 * border and border > 0:
-            est = est[..., border:-border]
+    result = (out_buf / cnt_buf).float().cpu().numpy()
+    if not is_demucs and mix.shape[-1] > 2 * border and border > 0:
+        result = result[..., border:-border]
 
-    instruments = config.training.instruments if use_demucs else prefer_target_instrument(config)
-    return {k: v for k, v in zip(instruments, est)}
+    instruments = cfg.training.instruments if is_demucs else prefer_target_instrument(cfg)
+    return {k: v for k, v in zip(instruments, result)}
 
 
 # ----------------------------------------------------------------------------- #
-#                                MÉTRICAS                                       #
+#                               MÉTRICAS (inalteradas)                          #
 # ----------------------------------------------------------------------------- #
-def sdr(references: np.ndarray, estimates: np.ndarray) -> np.ndarray:
+def sdr(ref: np.ndarray, est: np.ndarray) -> np.ndarray:
     eps = 1e-8
-    num = np.sum(np.square(references), axis=(1, 2)) + eps
-    den = np.sum(np.square(references - estimates), axis=(1, 2)) + eps
+    num = np.sum(ref**2, axis=(1, 2)) + eps
+    den = np.sum((ref - est) ** 2, axis=(1, 2)) + eps
     return 10 * np.log10(num / den)
 
 
 def si_sdr(reference: np.ndarray, estimate: np.ndarray) -> float:
     eps = 1e-8
     scale = np.sum(estimate * reference + eps, axis=(0, 1)) / np.sum(reference**2 + eps, axis=(0, 1))
-    scale = np.expand_dims(scale, axis=(0, 1))
-    reference = reference * scale
+    reference = reference * np.expand_dims(scale, (0, 1))
     return float(
         np.mean(
             10
@@ -201,70 +205,40 @@ def si_sdr(reference: np.ndarray, estimate: np.ndarray) -> float:
     )
 
 
-def L1Freq_metric(
-    reference: np.ndarray,
-    estimate: np.ndarray,
-    fft_size: int = 2048,
-    hop_size: int = 1024,
-    device: str = "cpu",
-) -> float:
-    reference = torch.from_numpy(reference).to(device)
-    estimate = torch.from_numpy(estimate).to(device)
-
-    reference_stft = torch.stft(reference, fft_size, hop_size, return_complex=True)
-    estimated_stft = torch.stft(estimate, fft_size, hop_size, return_complex=True)
-
-    loss = 10 * F.l1_loss(torch.abs(estimated_stft), torch.abs(reference_stft))
-    return 100 / (1.0 + float(loss.cpu().numpy()))
+def L1Freq_metric(reference: np.ndarray, estimate: np.ndarray, fft_size=2048, hop_size=1024, device="cpu") -> float:
+    ref = torch.from_numpy(reference).to(device)
+    est = torch.from_numpy(estimate).to(device)
+    loss = 10 * F.l1_loss(torch.abs(torch.stft(est, fft_size, hop_size, return_complex=True)),
+                          torch.abs(torch.stft(ref, fft_size, hop_size, return_complex=True)))
+    return 100 / (1 + float(loss.cpu()))
 
 
-def NegLogWMSE_metric(
-    reference: np.ndarray,
-    estimate: np.ndarray,
-    mixture: np.ndarray,
-    device: str = "cpu",
-) -> float:
+def NegLogWMSE_metric(reference: np.ndarray, estimate: np.ndarray, mix: np.ndarray, device="cpu") -> float:
     from torch_log_wmse import LogWMSE
 
-    log_wmse = LogWMSE(
-        audio_length=reference.shape[-1] / 44100,
-        sample_rate=44100,
-        return_as_loss=False,
-        bypass_filter=False,
-    )
-
-    reference = torch.from_numpy(reference).unsqueeze(0).unsqueeze(0).to(device)
-    estimate = torch.from_numpy(estimate).unsqueeze(0).unsqueeze(0).to(device)
-    mixture = torch.from_numpy(mixture).unsqueeze(0).to(device)
-
-    return -float(log_wmse(mixture, reference, estimate).cpu().numpy())
+    metric = LogWMSE(audio_length=reference.shape[-1] / 44100, sample_rate=44100, return_as_loss=False)
+    r = torch.from_numpy(reference)[None, None].to(device)
+    e = torch.from_numpy(estimate)[None, None].to(device)
+    m = torch.from_numpy(mix)[None].to(device)
+    return -float(metric(m, r, e).cpu())
 
 
-def AuraSTFT_metric(reference: np.ndarray, estimate: np.ndarray, device: str = "cpu") -> float:
+def AuraSTFT_metric(reference: np.ndarray, estimate: np.ndarray, device="cpu") -> float:
     from auraloss.freq import STFTLoss
 
-    stft_loss = STFTLoss(w_log_mag=1.0, w_lin_mag=0.0, w_sc=1.0, device=device)
-    reference = torch.from_numpy(reference).unsqueeze(0).to(device)
-    estimate = torch.from_numpy(estimate).unsqueeze(0).to(device)
-    return float(100 / (1.0 + 10 * stft_loss(reference, estimate)))
+    loss = STFTLoss(device=device)
+    r = torch.from_numpy(reference)[None].to(device)
+    e = torch.from_numpy(estimate)[None].to(device)
+    return float(100 / (1 + 10 * loss(r, e)))
 
 
-def AuraMRSTFT_metric(reference: np.ndarray, estimate: np.ndarray, device: str = "cpu") -> float:
+def AuraMRSTFT_metric(reference: np.ndarray, estimate: np.ndarray, device="cpu") -> float:
     from auraloss.freq import MultiResolutionSTFTLoss
 
-    mrstft_loss = MultiResolutionSTFTLoss(
-        fft_sizes=[1024, 2048, 4096],
-        hop_sizes=[256, 512, 1024],
-        win_lengths=[1024, 2048, 4096],
-        scale="mel",
-        n_bins=128,
-        sample_rate=44100,
-        perceptual_weighting=True,
-        device=device,
-    )
-    reference = torch.from_numpy(reference).unsqueeze(0).float().to(device)
-    estimate = torch.from_numpy(estimate).unsqueeze(0).float().to(device)
-    return float(100 / (1.0 + 10 * mrstft_loss(reference, estimate)))
+    loss = MultiResolutionSTFTLoss(device=device)
+    r = torch.from_numpy(reference)[None].float().to(device)
+    e = torch.from_numpy(estimate)[None].float().to(device)
+    return float(100 / (1 + 10 * loss(r, e)))
 
 
 def bleed_full(
@@ -274,20 +248,21 @@ def bleed_full(
     n_fft: int = 4096,
     hop_length: int = 1024,
     n_mels: int = 512,
-    device: str = "cpu",
+    device="cpu",
 ) -> Tuple[float, float]:
     from torchaudio.transforms import AmplitudeToDB
 
-    reference = torch.from_numpy(reference).float().to(device)
-    estimate = torch.from_numpy(estimate).float().to(device)
-    window = torch.hann_window(n_fft).to(device)
+    ref = torch.from_numpy(reference).float().to(device)
+    est = torch.from_numpy(estimate).float().to(device)
+    win = torch.hann_window(n_fft).to(device)
 
-    D1 = torch.abs(torch.stft(reference, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True))
-    D2 = torch.abs(torch.stft(estimate, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True))
+    D1 = torch.abs(torch.stft(ref, n_fft, hop_length, window=win, return_complex=True))
+    D2 = torch.abs(torch.stft(est, n_fft, hop_length, window=win, return_complex=True))
 
-    mel_basis = torch.from_numpy(librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)).to(device)
-    S1_db = AmplitudeToDB()(torch.matmul(mel_basis, D1))
-    S2_db = AmplitudeToDB()(torch.matmul(mel_basis, D2))
+    mel = torch.from_numpy(librosa.filters.mel(sr, n_fft, n_mels)).to(device)
+    S1, S2 = torch.matmul(mel, D1), torch.matmul(mel, D2)
+    S1_db = AmplitudeToDB()(S1)
+    S2_db = AmplitudeToDB()(S2)
 
     diff = S2_db - S1_db
     pos, neg = diff[diff > 0], diff[diff < 0]
@@ -301,32 +276,28 @@ def get_metrics(
     reference: np.ndarray,
     estimate: np.ndarray,
     mix: np.ndarray,
-    device: str = "cpu",
+    device="cpu",
 ) -> Dict[str, float]:
-    result: Dict[str, float] = {}
-    min_len = min(reference.shape[1], estimate.shape[1])
-    reference, estimate, mix = reference[..., :min_len], estimate[..., :min_len], mix[..., :min_len]
+    ret: Dict[str, float] = {}
+    L = min(reference.shape[1], estimate.shape[1])
+    reference, estimate, mix = reference[..., :L], estimate[..., :L], mix[..., :L]
 
     if "sdr" in metrics:
-        result["sdr"] = sdr(np.expand_dims(reference, 0), np.expand_dims(estimate, 0))[0]
+        ret["sdr"] = sdr(reference[None], estimate[None])[0]
     if "si_sdr" in metrics:
-        result["si_sdr"] = si_sdr(reference, estimate)
+        ret["si_sdr"] = si_sdr(reference, estimate)
     if "l1_freq" in metrics:
-        result["l1_freq"] = L1Freq_metric(reference, estimate, device=device)
+        ret["l1_freq"] = L1Freq_metric(reference, estimate, device=device)
     if "neg_log_wmse" in metrics:
-        result["neg_log_wmse"] = NegLogWMSE_metric(reference, estimate, mix, device=device)
+        ret["neg_log_wmse"] = NegLogWMSE_metric(reference, estimate, mix, device=device)
     if "aura_stft" in metrics:
-        result["aura_stft"] = AuraSTFT_metric(reference, estimate, device=device)
+        ret["aura_stft"] = AuraSTFT_metric(reference, estimate, device=device)
     if "aura_mrstft" in metrics:
-        result["aura_mrstft"] = AuraMRSTFT_metric(reference, estimate, device=device)
+        ret["aura_mrstft"] = AuraMRSTFT_metric(reference, estimate, device=device)
     if "bleedless" in metrics or "fullness" in metrics:
         b, f = bleed_full(reference, estimate, device=device)
         if "bleedless" in metrics:
-            result["bleedless"] = b
+            ret["bleedless"] = b
         if "fullness" in metrics:
-            result["fullness"] = f
-    return result
-
-
-def prefer_target_instrument(config: ConfigDict) -> List[str]:
-    return [config.training.target_instrument] if config.training.get("target_instrument") else config.training.instruments
+            ret["fullness"] = f
+    return ret
