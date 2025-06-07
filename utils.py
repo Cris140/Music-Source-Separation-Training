@@ -11,21 +11,19 @@ import torch.nn.functional as F
 from ml_collections import ConfigDict
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
-from typing import Dict, List, Tuple, Any, Union
+from typing import Dict, List, Tuple, Union
 
 
-# ----------------------------------------------------------------------------- #
-#                        CONFIG & MODEL LOADING                                 #
-# ----------------------------------------------------------------------------- #
-def load_config(model_type: str, config_path: str) -> Union[ConfigDict, OmegaConf]:
-    with open(config_path) as f:
-        if model_type == "htdemucs":
-            return OmegaConf.load(config_path)
-        return ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
+# ------------------------------------------------------------------ #
+# CONFIG & MODEL                                                     #
+# ------------------------------------------------------------------ #
+def load_config(model_type: str, cfg_path: str) -> Union[ConfigDict, OmegaConf]:
+    with open(cfg_path) as f:
+        return OmegaConf.load(cfg_path) if model_type == "htdemucs" else ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
 
 
-def get_model_from_config(model_type: str, config_path: str):
-    cfg = load_config(model_type, config_path)
+def get_model_from_config(model_type: str, cfg_path: str):
+    cfg = load_config(model_type, cfg_path)
     if model_type == "mdx23c":
         from models.mdx23c_tfc_tdf_v3 import TFC_TDF_net
 
@@ -81,13 +79,13 @@ def get_model_from_config(model_type: str, config_path: str):
     raise ValueError(f"Unknown model type: {model_type}")
 
 
-# ----------------------------------------------------------------------------- #
-#                               HELPERS                                         #
-# ----------------------------------------------------------------------------- #
-def _getWindowingArray(window_size: int, fade_size: int) -> torch.Tensor:
-    win = torch.ones(window_size)
-    win[:fade_size] = torch.linspace(0.0, 1.0, fade_size)
-    win[-fade_size:] = torch.linspace(1.0, 0.0, fade_size)
+# ------------------------------------------------------------------ #
+# HELPERS                                                            #
+# ------------------------------------------------------------------ #
+def _window_array(N: int, fade: int) -> torch.Tensor:
+    win = torch.ones(N)
+    win[:fade] = torch.linspace(0.0, 1.0, fade)
+    win[-fade:] = torch.linspace(1.0, 0.0, fade)
     return win
 
 
@@ -95,93 +93,96 @@ def prefer_target_instrument(cfg: ConfigDict) -> List[str]:
     return [cfg.training.target_instrument] if cfg.training.get("target_instrument") else cfg.training.instruments
 
 
-# ----------------------------------------------------------------------------- #
-#                               DEMIX                                           #
-# ----------------------------------------------------------------------------- #
+# ------------------------------------------------------------------ #
+# DEMIX                                                              #
+# ------------------------------------------------------------------ #
 def demix(
     cfg: ConfigDict,
     model: torch.nn.Module,
-    mix: torch.Tensor,  # tensor FP16 na GPU
+    mix: torch.Tensor,        # tensor FP16 na GPU
     device: torch.device,
     model_type: str,
     pbar: bool = False,
 ) -> Dict[str, np.ndarray]:
-    """Separa fontes, evitando qualquer mismatch de dimensão."""
 
     is_demucs = model_type == "htdemucs"
     if is_demucs:
-        chunk_size = cfg.training.samplerate * cfg.training.segment
+        chunk = cfg.training.samplerate * cfg.training.segment
+        overlap = cfg.inference.num_overlap
         n_inst = len(cfg.training.instruments)
-        step = chunk_size // cfg.inference.num_overlap
     else:
-        chunk_size = cfg.audio.chunk_size
+        chunk = cfg.audio.chunk_size
+        overlap = cfg.inference.num_overlap
         n_inst = len(prefer_target_instrument(cfg))
-        step = chunk_size // cfg.inference.num_overlap
-        fade_size = chunk_size // 10
-        border = chunk_size - step
-        win_base = _getWindowingArray(chunk_size, fade_size).to(device)
+        fade = chunk // 10
+        border = chunk - chunk // overlap
+        base_window = _window_array(chunk, fade).to(device)
         if mix.shape[-1] > 2 * border and border > 0:
             mix = nn.functional.pad(mix, (border, border), mode="reflect")
 
-    batch_size = cfg.inference.batch_size
+    step = chunk // overlap
+    batch = cfg.inference.batch_size
     use_amp = getattr(cfg.training, "use_amp", True)
 
-    out_buf = torch.zeros((n_inst,) + mix.shape[-2:], dtype=torch.float16, device=device)
-    cnt_buf = torch.zeros_like(out_buf)
+    out = torch.zeros((n_inst,) + mix.shape[-2:], dtype=torch.float16, device=device)
+    cnt = torch.zeros_like(out)
 
-    i = 0
-    chunks, meta = [], []
+    buf, meta, i = [], [], 0
     bar = tqdm(total=mix.shape[1], desc="chunks", leave=False) if pbar else None
 
     while i < mix.shape[1]:
-        part = mix[:, i : i + chunk_size]
-        raw_len = part.shape[-1]
-        part = nn.functional.pad(part, (0, chunk_size - raw_len), mode="reflect")
-        chunks.append(part)
-        meta.append((i, raw_len))
+        seg = mix[:, i : i + chunk]
+        seg_len = seg.shape[-1]
+        pad_back = chunk - seg_len
+
+        # -------- escolha segura do modo de padding --------
+        if pad_back > 0:
+            # 'reflect' só se o acolchoamento < comprimento do tensor
+            pad_mode = "reflect" if (not is_demucs and pad_back < seg_len) else "constant"
+            seg = nn.functional.pad(seg, (0, pad_back), mode=pad_mode)
+        buf.append(seg)
+        meta.append((i, seg_len))
         i += step
 
-        if len(chunks) >= batch_size or i >= mix.shape[1]:
+        if len(buf) >= batch or i >= mix.shape[1]:
             with torch.cuda.amp.autocast(device.type == "cuda" and use_amp), torch.inference_mode():
-                preds = model(torch.stack(chunks, 0))
+                pred = model(torch.stack(buf, 0))
 
-            for j, (start, raw_len) in enumerate(meta):
-                pred_len = preds[j].shape[-1]
+            for j, (st, raw_len) in enumerate(meta):
+                pred_len = pred[j].shape[-1]
                 usable = min(raw_len, pred_len)
 
                 if is_demucs:
-                    out_buf[..., start : start + usable] += preds[j, ..., :usable]
-                    cnt_buf[..., start : start + usable] += 1
+                    out[..., st : st + usable] += pred[j, ..., :usable]
+                    cnt[..., st : st + usable] += 1
                 else:
-                    win = win_base
-                    if start == 0:
+                    win = base_window
+                    if st == 0:
                         win = win.clone()
-                        win[:fade_size] = 1
+                        win[:fade] = 1
                     elif i >= mix.shape[1]:
                         win = win.clone()
-                        win[-fade_size:] = 1
+                        win[-fade:] = 1
+                    out[..., st : st + usable] += pred[j, ..., :usable] * win[..., :usable]
+                    cnt[..., st : st + usable] += win[..., :usable]
 
-                    out_buf[..., start : start + usable] += preds[j, ..., :usable] * win[..., :usable]
-                    cnt_buf[..., start : start + usable] += win[..., :usable]
-
-            chunks.clear()
-            meta.clear()
+            buf.clear(), meta.clear()
         if bar:
             bar.update(step)
     if bar:
         bar.close()
 
-    result = (out_buf / cnt_buf).float().cpu().numpy()
+    res = (out / cnt).float().cpu().numpy()
     if not is_demucs and mix.shape[-1] > 2 * border and border > 0:
-        result = result[..., border:-border]
+        res = res[..., border:-border]
 
-    instruments = cfg.training.instruments if is_demucs else prefer_target_instrument(cfg)
-    return {k: v for k, v in zip(instruments, result)}
+    insts = cfg.training.instruments if is_demucs else prefer_target_instrument(cfg)
+    return {k: v for k, v in zip(insts, res)}
 
 
-# ----------------------------------------------------------------------------- #
-#                               MÉTRICAS (inalteradas)                          #
-# ----------------------------------------------------------------------------- #
+# ------------------------------------------------------------------ #
+# MÉTRICAS (sem alterações de lógica)                                #
+# ------------------------------------------------------------------ #
 def sdr(ref: np.ndarray, est: np.ndarray) -> np.ndarray:
     eps = 1e-8
     num = np.sum(ref**2, axis=(1, 2)) + eps
@@ -192,7 +193,7 @@ def sdr(ref: np.ndarray, est: np.ndarray) -> np.ndarray:
 def si_sdr(reference: np.ndarray, estimate: np.ndarray) -> float:
     eps = 1e-8
     scale = np.sum(estimate * reference + eps, axis=(0, 1)) / np.sum(reference**2 + eps, axis=(0, 1))
-    reference = reference * np.expand_dims(scale, (0, 1))
+    reference *= np.expand_dims(scale, (0, 1))
     return float(
         np.mean(
             10
@@ -205,64 +206,58 @@ def si_sdr(reference: np.ndarray, estimate: np.ndarray) -> float:
     )
 
 
-def L1Freq_metric(reference: np.ndarray, estimate: np.ndarray, fft_size=2048, hop_size=1024, device="cpu") -> float:
-    ref = torch.from_numpy(reference).to(device)
-    est = torch.from_numpy(estimate).to(device)
-    loss = 10 * F.l1_loss(torch.abs(torch.stft(est, fft_size, hop_size, return_complex=True)),
-                          torch.abs(torch.stft(ref, fft_size, hop_size, return_complex=True)))
+def L1Freq_metric(ref: np.ndarray, est: np.ndarray, fft_size=2048, hop=1024, device="cpu") -> float:
+    r, e = torch.from_numpy(ref).to(device), torch.from_numpy(est).to(device)
+    loss = 10 * F.l1_loss(torch.abs(torch.stft(e, fft_size, hop, return_complex=True)),
+                          torch.abs(torch.stft(r, fft_size, hop, return_complex=True)))
     return 100 / (1 + float(loss.cpu()))
 
 
-def NegLogWMSE_metric(reference: np.ndarray, estimate: np.ndarray, mix: np.ndarray, device="cpu") -> float:
+def NegLogWMSE_metric(ref: np.ndarray, est: np.ndarray, mix: np.ndarray, device="cpu") -> float:
     from torch_log_wmse import LogWMSE
 
-    metric = LogWMSE(audio_length=reference.shape[-1] / 44100, sample_rate=44100, return_as_loss=False)
-    r = torch.from_numpy(reference)[None, None].to(device)
-    e = torch.from_numpy(estimate)[None, None].to(device)
-    m = torch.from_numpy(mix)[None].to(device)
-    return -float(metric(m, r, e).cpu())
+    wmse = LogWMSE(audio_length=ref.shape[-1] / 44100, sample_rate=44100, return_as_loss=False)
+    return -float(wmse(torch.from_numpy(mix)[None].to(device),
+                       torch.from_numpy(ref)[None, None].to(device),
+                       torch.from_numpy(est)[None, None].to(device)).cpu())
 
 
-def AuraSTFT_metric(reference: np.ndarray, estimate: np.ndarray, device="cpu") -> float:
+def AuraSTFT_metric(r: np.ndarray, e: np.ndarray, device="cpu") -> float:
     from auraloss.freq import STFTLoss
 
     loss = STFTLoss(device=device)
-    r = torch.from_numpy(reference)[None].to(device)
-    e = torch.from_numpy(estimate)[None].to(device)
-    return float(100 / (1 + 10 * loss(r, e)))
+    return float(100 / (1 + 10 * loss(torch.from_numpy(r)[None].to(device),
+                                      torch.from_numpy(e)[None].to(device))))
 
 
-def AuraMRSTFT_metric(reference: np.ndarray, estimate: np.ndarray, device="cpu") -> float:
+def AuraMRSTFT_metric(r: np.ndarray, e: np.ndarray, device="cpu") -> float:
     from auraloss.freq import MultiResolutionSTFTLoss
 
     loss = MultiResolutionSTFTLoss(device=device)
-    r = torch.from_numpy(reference)[None].float().to(device)
-    e = torch.from_numpy(estimate)[None].float().to(device)
-    return float(100 / (1 + 10 * loss(r, e)))
+    return float(100 / (1 + 10 * loss(torch.from_numpy(r)[None].float().to(device),
+                                      torch.from_numpy(e)[None].float().to(device))))
 
 
 def bleed_full(
-    reference: np.ndarray,
-    estimate: np.ndarray,
+    r: np.ndarray,
+    e: np.ndarray,
     sr: int = 44100,
     n_fft: int = 4096,
-    hop_length: int = 1024,
+    hop: int = 1024,
     n_mels: int = 512,
     device="cpu",
 ) -> Tuple[float, float]:
     from torchaudio.transforms import AmplitudeToDB
 
-    ref = torch.from_numpy(reference).float().to(device)
-    est = torch.from_numpy(estimate).float().to(device)
+    R = torch.from_numpy(r).float().to(device)
+    E = torch.from_numpy(e).float().to(device)
     win = torch.hann_window(n_fft).to(device)
 
-    D1 = torch.abs(torch.stft(ref, n_fft, hop_length, window=win, return_complex=True))
-    D2 = torch.abs(torch.stft(est, n_fft, hop_length, window=win, return_complex=True))
-
+    D1 = torch.abs(torch.stft(R, n_fft, hop, window=win, return_complex=True))
+    D2 = torch.abs(torch.stft(E, n_fft, hop, window=win, return_complex=True))
     mel = torch.from_numpy(librosa.filters.mel(sr, n_fft, n_mels)).to(device)
     S1, S2 = torch.matmul(mel, D1), torch.matmul(mel, D2)
-    S1_db = AmplitudeToDB()(S1)
-    S2_db = AmplitudeToDB()(S2)
+    S1_db, S2_db = AmplitudeToDB()(S1), AmplitudeToDB()(S2)
 
     diff = S2_db - S1_db
     pos, neg = diff[diff > 0], diff[diff < 0]
@@ -273,31 +268,31 @@ def bleed_full(
 
 def get_metrics(
     metrics: List[str],
-    reference: np.ndarray,
-    estimate: np.ndarray,
+    ref: np.ndarray,
+    est: np.ndarray,
     mix: np.ndarray,
     device="cpu",
 ) -> Dict[str, float]:
-    ret: Dict[str, float] = {}
-    L = min(reference.shape[1], estimate.shape[1])
-    reference, estimate, mix = reference[..., :L], estimate[..., :L], mix[..., :L]
+    res: Dict[str, float] = {}
+    L = min(ref.shape[1], est.shape[1])
+    ref, est, mix = ref[..., :L], est[..., :L], mix[..., :L]
 
     if "sdr" in metrics:
-        ret["sdr"] = sdr(reference[None], estimate[None])[0]
+        res["sdr"] = sdr(ref[None], est[None])[0]
     if "si_sdr" in metrics:
-        ret["si_sdr"] = si_sdr(reference, estimate)
+        res["si_sdr"] = si_sdr(ref, est)
     if "l1_freq" in metrics:
-        ret["l1_freq"] = L1Freq_metric(reference, estimate, device=device)
+        res["l1_freq"] = L1Freq_metric(ref, est, device=device)
     if "neg_log_wmse" in metrics:
-        ret["neg_log_wmse"] = NegLogWMSE_metric(reference, estimate, mix, device=device)
+        res["neg_log_wmse"] = NegLogWMSE_metric(ref, est, mix, device=device)
     if "aura_stft" in metrics:
-        ret["aura_stft"] = AuraSTFT_metric(reference, estimate, device=device)
+        res["aura_stft"] = AuraSTFT_metric(ref, est, device=device)
     if "aura_mrstft" in metrics:
-        ret["aura_mrstft"] = AuraMRSTFT_metric(reference, estimate, device=device)
+        res["aura_mrstft"] = AuraMRSTFT_metric(ref, est, device=device)
     if "bleedless" in metrics or "fullness" in metrics:
-        b, f = bleed_full(reference, estimate, device=device)
+        b, f = bleed_full(ref, est, device=device)
         if "bleedless" in metrics:
-            ret["bleedless"] = b
+            res["bleedless"] = b
         if "fullness" in metrics:
-            ret["fullness"] = f
-    return ret
+            res["fullness"] = f
+    return res
