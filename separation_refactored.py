@@ -103,7 +103,7 @@ if __name__=="__main__":
         flac_file=flac_file, pcm_type=pcm_type,
         use_tta=ARGS.use_tta, compile_mode=ARGS.compile_mode)
 
-    phase_fix_module.process_files(
+    phase_fix.process_files(
         base_folder=os.path.normpath(tmp_src),
         unwa_folder=os.path.normpath(tmp_tgt),
         output_folder=output_folder,
