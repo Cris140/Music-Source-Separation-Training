@@ -29,8 +29,8 @@ def _parse_args():
 cli = _parse_args()
 
 # -------------------- Configuração fixa ---------------------------
-input_path    = "C:/Users/Cris/Music-Source-Separation-Training/songs/"
-output_folder = "C:/Users/Cris/Music-Source-Separation-Training/separated/"
+input_path    = "./songs/"
+output_folder = "./separated/"
 source_model  = "VOCALS-Mel-Roformer FT3 Preview (by unwa)"
 target_model  = "INST-Mel-Roformer INSTV7 (by Gabox)"
 export_fmt    = "flac PCM_16"
