@@ -1,3 +1,4 @@
+#utils.py
 # coding: utf-8
 __author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
 
@@ -159,50 +160,18 @@ def _getWindowingArray(window_size: int, fade_size: int) -> torch.Tensor:
 def demix(
         config: ConfigDict,
         model: torch.nn.Module,
-        mix: torch.Tensor,
+        mix: torch.Tensor,            # agora já chega como tensor FP16 na GPU
         device: torch.device,
         model_type: str,
         pbar: bool = False
-) -> Tuple[List[Dict[str, np.ndarray]], np.ndarray]:
+) -> dict[str, np.ndarray]:
     """
-    Unified function for audio source separation with support for multiple processing modes.
-
-    This function separates audio into its constituent sources using either a generic custom logic
-    or a Demucs-specific logic. It supports batch processing and overlapping window-based chunking
-    for efficient and artifact-free separation.
-
-    Parameters:
-    ----------
-    config : ConfigDict
-        Configuration object containing audio and inference settings.
-    model : torch.nn.Module
-        The trained model used for audio source separation.
-    mix : torch.Tensor
-        Input audio tensor with shape (channels, time).
-    device : torch.device
-        The computation device (CPU or CUDA).
-    model_type : str, optional
-        Processing mode:
-            - "demucs" for logic specific to the Demucs model.
-        Default is "generic".
-    pbar : bool, optional
-        If True, displays a progress bar during chunk processing. Default is False.
-
-    Returns:
-    -------
-    Union[Dict[str, np.ndarray], np.ndarray]
-        - A dictionary mapping target instruments to separated audio sources if multiple instruments are present.
-        - A numpy array of the separated source if only one instrument is present.
+    Demix otimizado:
+    • mix já é tensor half() na GPU → nenhuma realocação.
+    • Janela de atenuação calculada uma vez.
     """
-
-    mix = torch.tensor(mix, dtype=torch.float32)
-
-    if model_type == 'htdemucs':
-        mode = 'demucs'
-    else:
-        mode = 'generic'
-    # Define processing parameters based on the mode
-    if mode == 'demucs':
+    use_demucs = (model_type == 'htdemucs')
+    if use_demucs:
         chunk_size = config.training.samplerate * config.training.segment
         num_instruments = len(config.training.instruments)
         num_overlap = config.inference.num_overlap
@@ -211,99 +180,57 @@ def demix(
         chunk_size = config.audio.chunk_size
         num_instruments = len(prefer_target_instrument(config))
         num_overlap = config.inference.num_overlap
-
         fade_size = chunk_size // 10
         step = chunk_size // num_overlap
         border = chunk_size - step
         length_init = mix.shape[-1]
-        windowing_array = _getWindowingArray(chunk_size, fade_size)
-        # Add padding for generic mode to handle edge artifacts
+        window = _getWindowingArray(chunk_size, fade_size).to(device)
         if length_init > 2 * border and border > 0:
             mix = nn.functional.pad(mix, (border, border), mode="reflect")
 
     batch_size = config.inference.batch_size
-
     use_amp = getattr(config.training, 'use_amp', True)
 
-    with torch.cuda.amp.autocast(enabled=use_amp):
+    with torch.cuda.amp.autocast(enabled=(device.type == "cuda" and use_amp)):
         with torch.inference_mode():
-            # Initialize result and counter tensors
-            req_shape = (num_instruments,) + mix.shape
-            result = torch.zeros(req_shape, dtype=torch.float32)
-            counter = torch.zeros(req_shape, dtype=torch.float32)
+            res = torch.zeros((num_instruments,) + mix.shape[-2:], dtype=torch.float16, device=device)
+            cnt = torch.zeros_like(res)
 
             i = 0
-            batch_data = []
-            batch_locations = []
-            progress_bar = tqdm(
-                total=mix.shape[1], desc="Processing audio chunks", leave=False
-            ) if pbar else None
-
+            buf, loc = [], []
+            bar = tqdm(total=mix.shape[1], desc="chunks", leave=False) if pbar else None
             while i < mix.shape[1]:
-                # Extract chunk and apply padding if necessary
-                part = mix[:, i:i + chunk_size].to(device)
-                chunk_len = part.shape[-1]
-                if mode == "generic" and chunk_len > chunk_size // 2:
-                    pad_mode = "reflect"
-                else:
-                    pad_mode = "constant"
-                part = nn.functional.pad(part, (0, chunk_size - chunk_len), mode=pad_mode, value=0)
-
-                batch_data.append(part)
-                batch_locations.append((i, chunk_len))
+                part = mix[:, i:i + chunk_size]
+                clen = part.shape[-1]
+                pad_mode = "reflect" if not use_demucs and clen > chunk_size // 2 else "constant"
+                part = nn.functional.pad(part, (0, chunk_size - clen), mode=pad_mode)
+                buf.append(part)
+                loc.append((i, clen))
                 i += step
-
-                # Process batch if it's full or the end is reached
-                if len(batch_data) >= batch_size or i >= mix.shape[1]:
-                    arr = torch.stack(batch_data, dim=0)
-                    x = model(arr)
-
-                    if mode == "generic":
-                        window = windowing_array
-                        if i - step == 0:  # First audio chunk, no fadein
-                            window[:fade_size] = 1
-                        elif i >= mix.shape[1]:  # Last audio chunk, no fadeout
-                            window[-fade_size:] = 1
-
-                    for j, (start, seg_len) in enumerate(batch_locations):
-                        if mode == "generic":
-                            result[..., start:start + seg_len] += x[j, ..., :seg_len].cpu() * window[..., :seg_len]
-                            counter[..., start:start + seg_len] += window[..., :seg_len]
+                if len(buf) >= batch_size or i >= mix.shape[1]:
+                    x = model(torch.stack(buf, 0))
+                    for j, (st, ln) in enumerate(loc):
+                        if use_demucs:
+                            res[..., st:st+ln] += x[j, ..., :ln]
+                            cnt[..., st:st+ln] += 1
                         else:
-                            result[..., start:start + seg_len] += x[j, ..., :seg_len].cpu()
-                            counter[..., start:start + seg_len] += 1.0
+                            win = window
+                            if st == 0:
+                                win = win.clone(); win[:fade_size] = 1
+                            elif i >= mix.shape[1]:
+                                win = win.clone(); win[-fade_size:] = 1
+                            res[..., st:st+ln] += x[j, ..., :ln] * win[..., :ln]
+                            cnt[..., st:st+ln] += win[..., :ln]
+                    buf.clear(); loc.clear()
+                if bar: bar.update(step)
+            if bar: bar.close()
 
-                    batch_data.clear()
-                    batch_locations.clear()
+            est = (res / cnt).float().cpu().numpy()
+            if not use_demucs and length_init > 2 * border and border > 0:
+                est = est[..., border:-border]
 
-                if progress_bar:
-                    progress_bar.update(step)
-
-            if progress_bar:
-                progress_bar.close()
-
-            # Compute final estimated sources
-            estimated_sources = result / counter
-            estimated_sources = estimated_sources.cpu().numpy()
-            np.nan_to_num(estimated_sources, copy=False, nan=0.0)
-
-            # Remove padding for generic mode
-            if mode == "generic":
-                if length_init > 2 * border and border > 0:
-                    estimated_sources = estimated_sources[..., border:-border]
-
-    # Return the result as a dictionary or a single array
-    if mode == "demucs":
-        instruments = config.training.instruments
-    else:
-        instruments = prefer_target_instrument(config)
-
-    ret_data = {k: v for k, v in zip(instruments, estimated_sources)}
-
-    if mode == "demucs" and num_instruments <= 1:
-        return estimated_sources
-    else:
-        return ret_data
+    insts = (config.training.instruments if use_demucs else prefer_target_instrument(config))
+    return {k: v for k, v in zip(insts, est)}
 
 
 def sdr(references: np.ndarray, estimates: np.ndarray) -> np.ndarray:
