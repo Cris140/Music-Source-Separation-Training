@@ -1,12 +1,13 @@
 # coding: utf-8
 """
-Inference otimizada para Mel-Roformer · VRAM friendly
-─────────────────────────────────────────────────────
-Novidades
-• Flag --compile_mode  [default|reduce|autotune|off]
-• torch.cuda.empty_cache() após cada música
-• chunk_size/batch_size continuam configuráveis
+Inference otimizado · Jun/2025
+---------------------------------
+Novidades:
+• Converte para PCM_int (16/24 bits) antes do sf.write em FLAC,
+  eliminando o AssertionError.
+• Clipping em [-1, 1] e uso de numpy contíguo.
 """
+
 from __future__ import annotations
 import argparse, time, librosa, os, glob, torch, warnings, numpy as np, soundfile as sf
 from tqdm.auto import tqdm
@@ -16,6 +17,7 @@ from utils import prefer_target_instrument, demix, get_model_from_config
 warnings.filterwarnings("ignore")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_flush_denormal(True)
+
 
 # --------------------------------------------------------------------------
 def run_inference(
@@ -33,10 +35,10 @@ def run_inference(
     flac_file: bool = False,
     pcm_type: str = "PCM_24",
     use_tta: bool = False,
-    compile_mode: str = "default",      # ← NOVO
+    compile_mode: str = "default",
 ) -> None:
 
-    args_list: list[str] = [
+    args = [
         "--model_type", model_type,
         "--config_path", config_path,
         "--start_check_point", start_check_point,
@@ -44,37 +46,37 @@ def run_inference(
         "--device_ids", *map(str, device_ids if isinstance(device_ids, list) else [device_ids]),
         "--compile_mode", compile_mode,
     ]
-    if input_folder:          args_list += ["--input_folder", input_folder]
-    if input_file:            args_list += ["--input_file", input_file]
-    if extract_instrumental:  args_list.append("--extract_instrumental")
-    if disable_detailed_pbar: args_list.append("--disable_detailed_pbar")
-    if force_cpu:             args_list.append("--force_cpu")
-    if flac_file:             args_list.append("--flac_file")
-    if pcm_type:              args_list += ["--pcm_type", pcm_type]
-    if use_tta:               args_list.append("--use_tta")
+    if input_folder:          args += ["--input_folder", input_folder]
+    if input_file:            args += ["--input_file", input_file]
+    if extract_instrumental:  args.append("--extract_instrumental")
+    if disable_detailed_pbar: args.append("--disable_detailed_pbar")
+    if force_cpu:             args.append("--force_cpu")
+    if flac_file:             args.append("--flac_file")
+    if pcm_type:              args += ["--pcm_type", pcm_type]
+    if use_tta:               args.append("--use_tta")
 
-    proc_folder(args_list)
+    proc_folder(args)
+
 
 # --------------------------------------------------------------------------
 def run_folder(model, args, config, device) -> None:
     start = time.time()
     model.eval()
 
+    # ---------------- lista de arquivos -----------------
     if args.input_file:
-        if not os.path.isfile(args.input_file):
-            raise FileNotFoundError(f"Input file '{args.input_file}' não encontrado.")
-        all_paths = [args.input_file]
+        files = [args.input_file]
     else:
         exts = {".mp3",".wav",".flac",".aac",".ogg",".m4a",".weba",".mp4",".webm",".opus"}
-        all_paths = [f for f in glob.glob(os.path.join(args.input_folder, "*"))
-                     if os.path.isfile(f) and os.path.splitext(f)[1].lower() in exts]
-        all_paths.sort()
+        files = [f for f in glob.glob(os.path.join(args.input_folder, "*"))
+                 if os.path.isfile(f) and os.path.splitext(f)[1].lower() in exts]
+        files.sort()
 
     sr = config.audio.get("sample_rate", 44100)
     instruments = prefer_target_instrument(config)[:]
     os.makedirs(args.store_dir, exist_ok=True)
 
-    for path in tqdm(all_paths, desc="Processamento"):
+    for path in tqdm(files, desc="Processamento"):
         mix, _ = librosa.load(path, sr=sr, mono=False)
         if mix.ndim == 1:
             mix = np.stack([mix, mix], axis=0)
@@ -85,45 +87,54 @@ def run_folder(model, args, config, device) -> None:
             mean, std = mono.mean(), mono.std()
             mix = (mix - mean) / std
 
-        mixes = ([mix, mix[::-1].copy(), -mix] if args.use_tta else [mix])
+        mixes = ([mix, mix[::-1], -mix] if args.use_tta else [mix])
         tensors = [torch.as_tensor(m, dtype=torch.float16, device=device) for m in mixes]
 
-        outs = [demix(config, model, t, device,
-                      model_type=args.model_type,
-                      pbar=not args.disable_detailed_pbar) for t in tensors]
+        results = [demix(config, model, t, device, model_type=args.model_type,
+                         pbar=not args.disable_detailed_pbar) for t in tensors]
 
-        wavs = outs[0]
-        for i, o in enumerate(outs[1:], 1):
-            for k in o:
-                wavs[k] += (-o[k] if i == 2 else o[k][::-1].copy())
-        for k in wavs: wavs[k] /= len(outs)
+        wavs = results[0]
+        for i, r in enumerate(results[1:], 1):
+            for k in r:
+                wavs[k] += -r[k] if i == 2 else r[k][::-1]
+
+        for k in wavs:
+            wavs[k] /= len(results)
 
         if args.extract_instrumental:
             ref = "vocals" if "vocals" in instruments else instruments[0]
             if "instrumental" not in instruments: instruments.append("instrumental")
             wavs["instrumental"] = mix_orig - wavs[ref]
 
+        # ------------- salvar stems --------------
         base = os.path.splitext(os.path.basename(path))[0]
         for inst in instruments:
             est = wavs[inst].T
-            if config.inference.get("normalize", False): est = est * std + mean
+            if config.inference.get("normalize", False):
+                est = est * std + mean
+
             if args.flac_file:
-                sf.write(os.path.join(args.store_dir,f"{base}_{inst}.flac"),
-                         est, sr, subtype=("PCM_16" if args.pcm_type=="PCM_16" else "PCM_24"))
+                outfile = os.path.join(args.store_dir, f"{base}_{inst}.flac")
+                est = np.clip(est, -1.0, 1.0)                 # evita overflow
+                if args.pcm_type == "PCM_16":
+                    est_int = (est * 32767.0).round().astype(np.int16)
+                else:  # PCM_24 → usa int32 com 24 bits significativos
+                    est_int = (est * 8388607.0).round().astype(np.int32)
+                est_int = np.ascontiguousarray(est_int)
+                sf.write(outfile, est_int, sr, subtype=args.pcm_type)
             else:
-                sf.write(os.path.join(args.store_dir,f"{base}_{inst}.wav"),
-                         est, sr, subtype="FLOAT")
+                outfile = os.path.join(args.store_dir, f"{base}_{inst}.wav")
+                sf.write(outfile, np.ascontiguousarray(est.astype(np.float32)),
+                         sr, subtype="FLOAT")
 
-        if device.type == "cuda":   # libera cache entre faixas
-            torch.cuda.empty_cache()
+    print(f"Inferência concluída em {time.time()-start:.1f}s")
 
-    print(f"Inferência: {time.time()-start:.1f}s")
 
 # --------------------------------------------------------------------------
 def proc_folder(arg_list: list[str] | None = None) -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--model_type", type=str, default="mdx23c")
-    p.add_argument("--config_path", required=True)
+    p.add_argument("--model_type")
+    p.add_argument("--config_path")
     p.add_argument("--start_check_point", default="")
     p.add_argument("--input_folder"); p.add_argument("--input_file")
     p.add_argument("--store_dir", required=True)
@@ -135,39 +146,36 @@ def proc_folder(arg_list: list[str] | None = None) -> None:
     p.add_argument("--pcm_type", choices=["PCM_16","PCM_24"], default="PCM_24")
     p.add_argument("--use_tta", action="store_true")
     p.add_argument("--compile_mode", choices=["default","reduce","autotune","off"],
-                   default="default")              # ← NOVO
+                   default="default")
     args = p.parse_args(arg_list)
 
-    # dispositivo ------------------------------------------------------
+    # --------------- dispositivo ---------------
     if args.force_cpu:          device = torch.device("cpu")
     elif torch.cuda.is_available(): device = torch.device(f"cuda:{args.device_ids[0]}")
     elif torch.backends.mps.is_available(): device = torch.device("mps")
-    else:                       device = torch.device("cpu")
+    else: device = torch.device("cpu")
     print("Dispositivo:", device)
 
-    # modelo -----------------------------------------------------------
+    # --------------- modelo --------------------
     model, cfg = get_model_from_config(args.model_type, args.config_path)
     if args.start_check_point:
-        s = torch.load(args.start_check_point, map_location="cpu")
-        s = s.get("state_dict", s.get("state", s))
-        model.load_state_dict(s, strict=False)
+        state = torch.load(args.start_check_point, map_location="cpu")
+        state = state.get("state_dict", state.get("state", state))
+        model.load_state_dict(state, strict=False)
 
-    if device.type=="cuda":
+    if device.type == "cuda":
         model = model.half().to(device)
-
-        # torch.compile opcional
-        if args.compile_mode!="off" and torch.__version__.startswith("2"):
-            mode = {"default":None,"reduce":"reduce-overhead",
-                    "autotune":"max-autotune"}[args.compile_mode]
+        if args.compile_mode != "off" and torch.__version__.startswith("2"):
+            mode = {"default": None, "reduce": "reduce-overhead", "autotune": "max-autotune"}[args.compile_mode]
             model = torch.compile(model, mode=mode)
-
     else:
         model = model.to(device)
 
-    if len(args.device_ids)>1 and device.type=="cuda":
+    if len(args.device_ids) > 1 and device.type == "cuda":
         model = nn.DataParallel(model, device_ids=args.device_ids)
 
     run_folder(model, args, cfg, device)
+
 
 if __name__ == "__main__":
     run_inference(model_type="mdx23c", config_path="config.yaml",
