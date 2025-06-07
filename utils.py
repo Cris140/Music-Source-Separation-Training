@@ -134,10 +134,7 @@ def demix(
         seg = mix[:, i : i + chunk]
         seg_len = seg.shape[-1]
         pad_back = chunk - seg_len
-
-        # -------- escolha segura do modo de padding --------
         if pad_back > 0:
-            # 'reflect' só se o acolchoamento < comprimento do tensor
             pad_mode = "reflect" if (not is_demucs and pad_back < seg_len) else "constant"
             seg = nn.functional.pad(seg, (0, pad_back), mode=pad_mode)
         buf.append(seg)
@@ -158,21 +155,22 @@ def demix(
                 else:
                     win = base_window
                     if st == 0:
-                        win = win.clone()
-                        win[:fade] = 1
+                        win = win.clone(); win[:fade] = 1
                     elif i >= mix.shape[1]:
-                        win = win.clone()
-                        win[-fade:] = 1
+                        win = win.clone(); win[-fade:] = 1
                     out[..., st : st + usable] += pred[j, ..., :usable] * win[..., :usable]
                     cnt[..., st : st + usable] += win[..., :usable]
 
-            buf.clear(), meta.clear()
-        if bar:
-            bar.update(step)
-    if bar:
-        bar.close()
+            buf.clear(); meta.clear()
+        if bar: bar.update(step)
+    if bar: bar.close()
 
-    res = (out / cnt).float().cpu().numpy()
+    # ---------------------  CORREÇÃO  -----------------------
+    with torch.no_grad():
+        res = torch.nan_to_num(out / cnt, nan=0.0, posinf=0.0, neginf=0.0)  # ★
+    res = res.float().cpu().numpy()
+    # --------------------------------------------------------
+
     if not is_demucs and mix.shape[-1] > 2 * border and border > 0:
         res = res[..., border:-border]
 
